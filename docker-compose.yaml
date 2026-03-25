@@ -1,4 +1,4 @@
-version: '3.8'
+# version: '3.8'
 
 services:
   redis:
@@ -27,10 +27,14 @@ services:
     image: jaegertracing/all-in-one:latest
     container_name: jaeger
     ports:
-      - "16686:16686"#Web UI
-      - "14268:14268"#HTTP收集端口
-      - "4317:4317"#OTLP gRPC
-      - "4318:4318"#OTLP HTTP
+      - "16686:16686"
+      #Web UI
+      - "14268:14268"
+      #HTTP收集端口
+      - "4317:4317"
+      #OTLP gRPC
+      - "4318:4318"
+      #OTLP HTTP
     environment:
       - COLLECTOR_OTLP_ENABLED=true
     restart: always
@@ -56,3 +60,24 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: always
+
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.9
+    container_name: seckill-etcd
+    ports:
+      - "2379:2379"
+      - "2380:2380"
+    command:
+      - /usr/local/bin/etcd
+      - --name=seckill-etcd
+      - --advertise-client-urls=http://0.0.0.0:2379
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --initial-advertise-peer-urls=http://0.0.0.0:2380
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-cluster=seckill-etcd=http://0.0.0.0:2380
+      - --data-dir=/etcd-data
+    volumes:
+      - etcd_data:/etcd-data
+
+volumes:
+  etcd_data:
