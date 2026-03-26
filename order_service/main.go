@@ -11,7 +11,6 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	amqp "github.com/rabbitmq/amqp091-go"
-	"github.com/spf13/viper"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
@@ -229,7 +228,7 @@ func main() {
 	//最先加载配置
 	config.InitConfig("order")
 
-	port := viper.GetString("server.port")
+	port := config.Conf.Server.Port
 	if port == "" {
 		port = "50052"
 		log.Println("配置文件未指定端口，使用默认端口 50052")

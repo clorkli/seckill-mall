@@ -14,5 +14,3 @@ etcd/
 redis/
 
 tmp/
-
-config/product.yaml

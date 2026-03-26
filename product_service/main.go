@@ -9,7 +9,6 @@ import (
 	"seckill-mall/common/config"
 	"strconv"
 
-	"github.com/spf13/viper"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
 	"gorm.io/driver/mysql"
@@ -228,8 +227,8 @@ func main() {
 	shutdown := tracer.InitTracer("product-service", "localhost:4318")
 	defer shutdown(context.Background())
 	config.InitConfig("product")
-	//获取端口
-	port := viper.GetString("server.product_port")
+	// 统一端口键：server.port
+	port := config.Conf.Server.Port
 	if port == "" {
 		port = "50051"
 	}

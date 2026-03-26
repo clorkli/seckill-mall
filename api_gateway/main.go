@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"strconv"
 	"time"
 
@@ -196,6 +197,12 @@ func main() {
 		})
 	})
 
-	fmt.Println("=== API 网关已启动 (Port: 8080) ===")
-	r.Run(":8080")
+	port := config.Conf.Server.Port
+	if port == "" {
+		port = "8080"
+	}
+
+	addr := net.JoinHostPort("", port)
+	fmt.Printf("=== API 网关已启动 (Port: %s) ===\n", addr)
+	r.Run(addr)
 }
