@@ -5,7 +5,7 @@ server:
   metrics_port: "9091"
 
 mysql:
-  dsn: "root:123456@tcp(127.0.0.1:3306)/seckill?charset=utf8mb4&parseTime=True&loc=Local"
+  dsn: "" # 推荐通过环境变量 SECKILL_MYSQL_DSN 注入
 
 redis:
   addr: "localhost:6379"

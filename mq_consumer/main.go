@@ -15,8 +15,6 @@ import (
 )
 
 const (
-	MQ_URL = "amqp://guest:guest@localhost:5672/"
-
 	OrderQueue = "seckill_order_queue"
 
 	DeadExchange   = "dlx_exchange" // 死信交换机
@@ -95,8 +93,12 @@ var db *gorm.DB
 func main() {
 	config.InitConfig("mq")
 	initDB()
+	mqURL := config.Conf.MQ.URL
+	if mqURL == "" {
+		log.Fatal("mq.url 为空，请在 config/mq.yaml 设置或通过环境变量 SECKILL_MQ_URL 注入")
+	}
 
-	conn, err := amqp.Dial(MQ_URL)
+	conn, err := amqp.Dial(mqURL)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -182,6 +184,10 @@ func main() {
 
 func initDB() {
 	dsn := config.Conf.MySQL.DSN
+	if dsn == "" {
+		log.Fatal("mysql.dsn 为空，请在 config/mq.yaml 设置或通过环境变量 SECKILL_MYSQL_DSN 注入")
+	}
+
 	var err error
 	db, err = gorm.Open(mysql.Open(dsn), &gorm.Config{})
 	if err != nil {

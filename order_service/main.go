@@ -32,7 +32,6 @@ const (
 	SERVICE_NAME = "seckill/order"
 
 	PRODUCT_SERVICE_NAME = "etcd:///seckill/product"
-	MQ_URL               = "amqp://guest:guest@localhost:5672/"
 	MQ_QUEUE_NAME        = "seckill_order_queue"
 	DeadExchange         = "dlx_exchange" // 死信交换机
 	DeadRoutingKey       = "dead_key"
@@ -138,7 +137,12 @@ func (s *server) CreateOrder(ctx context.Context, req *pb.CreateOrderRequest) (*
 
 // 初始化RabbitMQ连接
 func initMQ() {
-	conn, err := amqp.Dial(MQ_URL)
+	mqURL := config.Conf.MQ.URL
+	if mqURL == "" {
+		log.Fatalf("mq.url 为空，请在 config/order.yaml 设置或通过环境变量 SECKILL_MQ_URL 注入")
+	}
+
+	conn, err := amqp.Dial(mqURL)
 	if err != nil {
 		log.Fatalf("连接RabbitMQ失败: %v", err)
 	}

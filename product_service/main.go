@@ -215,6 +215,10 @@ func RegisterEtcd(port string) {
 
 func initDB() {
 	dsn := config.Conf.MySQL.DSN
+	if dsn == "" {
+		log.Fatal("mysql.dsn 为空，请在 config/product.yaml 设置或通过环境变量 SECKILL_MYSQL_DSN 注入")
+	}
+
 	var err error
 	db, err = gorm.Open(mysql.Open(dsn), &gorm.Config{})
 	if err != nil {

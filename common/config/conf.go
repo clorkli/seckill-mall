@@ -2,6 +2,7 @@ package config
 
 import (
 	"log"
+	"os"
 
 	"github.com/spf13/viper"
 )
@@ -9,6 +10,7 @@ import (
 type Config struct {
 	Server  ServerConfig  `mapstructure:"server"`
 	MySQL   MySQLConfig   `mapstructure:"mysql"`
+	MQ      MQConfig      `mapstructure:"mq"`
 	Redis   RedisConfig   `mapstructure:"redis"`
 	Etcd    EtcdConfig    `mapstructure:"etcd"`
 	Seckill SeckillConfig `mapstructure:"seckill"`
@@ -24,6 +26,10 @@ type ServerConfig struct {
 
 type MySQLConfig struct {
 	DSN string `mapstructure:"dsn"`
+}
+
+type MQConfig struct {
+	URL string `mapstructure:"url"`
 }
 
 type RedisConfig struct {
@@ -66,5 +72,21 @@ func InitConfig(filename string) {
 		log.Fatalf("解析配置文件失败: %v", err)
 	}
 
+	applyEnvOverrides()
+
 	log.Println("配置加载成功！")
+}
+
+func applyEnvOverrides() {
+	if dsn := os.Getenv("SECKILL_MYSQL_DSN"); dsn != "" {
+		Conf.MySQL.DSN = dsn
+	}
+
+	if secret := os.Getenv("SECKILL_JWT_SECRET"); secret != "" {
+		Conf.JWT.Secret = secret
+	}
+
+	if mqURL := os.Getenv("SECKILL_MQ_URL"); mqURL != "" {
+		Conf.MQ.URL = mqURL
+	}
 }

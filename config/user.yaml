@@ -1,3 +1,3 @@
 jwt:
   expire: "24h"
-  secret: "seckill_secret"
+  secret: "" # 推荐通过环境变量 SECKILL_JWT_SECRET 注入

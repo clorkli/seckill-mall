@@ -4,7 +4,10 @@ server:
   mode: "debug"
 
 mysql:
-  dsn: "root:password@tcp(127.0.0.1:3306)/seckill..."
+  dsn: "" # 通过环境变量 SECKILL_MYSQL_DSN 注入
+
+mq:
+  url: "" # 通过环境变量 SECKILL_MQ_URL 注入
 
 redis:
   addr: "localhost:6379"
@@ -16,3 +19,7 @@ etcd:
 
 seckill:
   purchase_limit: 5 #配置限购件数，默认为5
+
+jwt:
+  expire: "24h"
+  secret: "" # 通过环境变量 SECKILL_JWT_SECRET 注入
