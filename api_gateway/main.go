@@ -31,6 +31,11 @@ import (
 )
 
 func initSentinel() {
+	const (
+		resourceName = "create_order"
+		threshold    = float64(1000) //将限流阈值与日志输出绑定
+	)
+
 	// 初始化 Sentinel
 	err := sentinel.InitDefault()
 	if err != nil {
@@ -40,17 +45,18 @@ func initSentinel() {
 	// 配置限流规则
 	_, err = flow.LoadRules([]*flow.Rule{
 		{
-			Resource:               "create_order", // 资源名称
-			TokenCalculateStrategy: flow.Direct,    //直接计数
-			ControlBehavior:        flow.Reject,    //直接拒绝
-			Threshold:              1000,           // 为了测试暂定每秒允许的最大请求数为1000
-			StatIntervalInMs:       1000,           // 统计周期1秒
+			Resource:               resourceName, // 资源名称
+			TokenCalculateStrategy: flow.Direct,  // 直接计数
+			ControlBehavior:        flow.Reject,  // 直接拒绝
+			Threshold:              threshold,
+			StatIntervalInMs:       1000, // 统计周期1秒
 		},
 	})
 	if err != nil {
 		log.Fatalf("加载限流规则失败: %v", err)
 	}
-	log.Println("Sentinel限流规则已加载：create_order 每秒最大请求数 5")
+
+	log.Printf("Sentinel限流规则已加载：%s 每秒最大请求数 %.0f", resourceName, threshold)
 }
 
 func main() {
