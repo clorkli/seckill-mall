@@ -184,6 +184,10 @@ func main() {
 			c.JSON(400, gin.H{"error": "参数错误"})
 			return
 		}
+		if req.Count <= 0 {
+			c.JSON(400, gin.H{"error": "购买数量必须大于0"})
+			return
+		}
 
 		resp, err := orderClient.CreateOrder(c.Request.Context(), &pb.CreateOrderRequest{
 			UserId:    userID.(int64),

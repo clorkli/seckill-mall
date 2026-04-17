@@ -56,6 +56,13 @@ type server struct {
 func (s *server) CreateOrder(ctx context.Context, req *pb.CreateOrderRequest) (*pb.CreateOrderResponse, error) {
 	fmt.Printf("收到下单请求，用户: %d, 商品: %d\n", req.UserId, req.ProductId)
 
+	if req.Count <= 0 {
+		return &pb.CreateOrderResponse{
+			Success: false,
+			Message: "购买数量必须大于0",
+		}, nil
+	}
+
 	//扣减 Redis 库存作为防超卖第一道防线
 	deductResp, err := productClient.DeductStock(ctx, &pb.DeductStockRequest{
 		ProductId: req.ProductId,

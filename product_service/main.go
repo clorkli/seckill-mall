@@ -66,6 +66,14 @@ return 1
 // 升级 DeductStock 接口，区分库存为零与商品不存在两种情况
 func (s *server) DeductStock(ctx context.Context, req *pb.DeductStockRequest) (*pb.DeductStockResponse, error) {
 	fmt.Printf("[Trace]扣减库存：用户%d, 商品%d, 数量%d\n", req.UserId, req.ProductId, req.Count)
+
+	if req.Count <= 0 {
+		return &pb.DeductStockResponse{
+			Success: false,
+			Message: "购买数量必须大于0",
+		}, nil
+	}
+
 	// 拼接 Key: product:stock:1
 	stockKey := "product:stock:" + strconv.FormatInt(req.ProductId, 10)
 	userSetKey := "product:users:" + strconv.FormatInt(req.ProductId, 10) //新增用户购买集合Key
