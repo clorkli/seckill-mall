@@ -247,8 +247,11 @@ WHERE id = 1;
 - Order metrics：`http://127.0.0.1:9092/metrics`
 - MQ Consumer metrics：`http://127.0.0.1:9093/metrics`
 - DLQ Consumer metrics：`http://127.0.0.1:9094/metrics`
+- RabbitMQ broker metrics：`http://127.0.0.1:15692/metrics`
 
 DLQ Consumer 的 metrics 端口默认是 `9094`，可以通过 `SECKILL_DLQ_METRICS_PORT` 覆盖。
+
+RabbitMQ broker metrics 由 `rabbitmq_prometheus` 插件提供，Prometheus 会通过 Docker 网络抓取 `rabbitmq:15692`。业务侧 MQ 指标用于观察发布、消费、补偿和重连；broker 侧指标用于观察队列积压、连接数、channel 数、consumer 数、消息 ready/unacked 等 RabbitMQ 自身状态。
 
 ## 当前注意事项
 
@@ -257,23 +260,22 @@ DLQ Consumer 的 metrics 端口默认是 `9094`，可以通过 `SECKILL_DLQ_METR
 - Product Service 在 `debug` 模式下会启用 `/dev/reset`，该接口会清空 Redis 和 `orders` 表，但当前不会自动恢复 `product.stock` 到初始值。
 - DLQ Consumer 已支持常见落库失败后的 Redis 补偿，但对用户购买记录小于回滚数量等异常状态仍需要人工核查日志。
 - RabbitMQ 生产者侧已启用 publisher confirm、persistent message、mandatory return 和失败重连重试；Consumer 侧已支持连接断开后自动重连。
-- 当前已接入业务侧 MQ 指标，RabbitMQ broker 自身队列积压、连接数、channel 数等指标仍待接入 RabbitMQ Prometheus 插件或 exporter。
+- 当前已接入业务侧 MQ 指标和 RabbitMQ broker 指标，但还没有内置 Grafana dashboard 与 Prometheus alert 规则。
 - etcd 注册地址当前偏本地开发场景，服务地址仍以 `127.0.0.1` 为主，多机或容器化部署需要调整。
 
 ## 继续优化方向
 
 建议按优先级继续推进：
 
-1. 接入 RabbitMQ broker 指标：通过 RabbitMQ Prometheus 插件或 exporter 采集队列积压、连接数、channel 数、consumer 数和 redeliver 速率。
-2. 增加 Grafana dashboard 和 Prometheus alert：展示 MQ publish、consume、DLQ 补偿、重连、队列积压，并配置失败率和积压告警。
-3. 引入 MQ trace propagation：把 trace context 写入 RabbitMQ headers，让下单请求和异步消费链路在 Jaeger 中串起来。
-4. 引入 Outbox 模式：进一步降低“Redis 已扣减但 MQ 确认状态不明”这类分布式边界风险。
-5. 修复开发重置能力：让 `/dev/reset` 同步恢复 `product.stock` 到测试初始库存，或改成显式传入重置库存。
-6. 抽离订单状态：引入订单状态机，例如排队中、已创建、失败、已取消，避免只依赖 MQ 成功与否判断订单结果。
-7. 增加查询接口：增加订单查询接口，用户下单后可以查询异步处理结果。
-8. 改善服务注册：etcd 注册地址改为可配置，支持 Docker、WSL、多机部署场景。
-9. 增加自动化测试：补充 Redis Lua、库存回滚、Consumer 幂等、MySQL 事务扣库存、DLQ 补偿、MQ 发布确认和消费端重连等核心测试。
-10. 增加数据库迁移并完善安全边界：引入 migration 工具，关闭生产环境 `/dev/reset`，JWT secret 强度校验，敏感日志脱敏。
+1. 增加 Grafana dashboard 和 Prometheus alert：展示 MQ publish、consume、DLQ 补偿、重连、队列积压，并配置失败率和积压告警。
+2. 引入 MQ trace propagation：把 trace context 写入 RabbitMQ headers，让下单请求和异步消费链路在 Jaeger 中串起来。
+3. 引入 Outbox 模式：进一步降低“Redis 已扣减但 MQ 确认状态不明”这类分布式边界风险。
+4. 修复开发重置能力：让 `/dev/reset` 同步恢复 `product.stock` 到测试初始库存，或改成显式传入重置库存。
+5. 抽离订单状态：引入订单状态机，例如排队中、已创建、失败、已取消，避免只依赖 MQ 成功与否判断订单结果。
+6. 增加查询接口：增加订单查询接口，用户下单后可以查询异步处理结果。
+7. 改善服务注册：etcd 注册地址改为可配置，支持 Docker、WSL、多机部署场景。
+8. 增加自动化测试：补充 Redis Lua、库存回滚、Consumer 幂等、MySQL 事务扣库存、DLQ 补偿、MQ 发布确认和消费端重连等核心测试。
+9. 增加数据库迁移并完善安全边界：引入 migration 工具，关闭生产环境 `/dev/reset`，JWT secret 强度校验，敏感日志脱敏。
 
 ## 技术栈
 
