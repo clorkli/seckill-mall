@@ -11,6 +11,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	amqp "github.com/rabbitmq/amqp091-go"
 	"google.golang.org/grpc"
@@ -48,6 +50,47 @@ type OrderMessage struct {
 
 var productClient pb.ProductServiceClient
 var mqPublisher *MQPublisher
+
+var (
+	mqPublishTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "seckill_mq_publish_total",
+			Help: "Total number of RabbitMQ publish attempts by result.",
+		},
+		[]string{"result"},
+	)
+	mqPublishRetryTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "seckill_mq_publish_retry_total",
+			Help: "Total number of RabbitMQ publish retries.",
+		},
+	)
+	mqPublishReturnTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "seckill_mq_publish_return_total",
+			Help: "Total number of RabbitMQ returned messages.",
+		},
+	)
+	mqPublishConfirmNackTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "seckill_mq_publish_confirm_nack_total",
+			Help: "Total number of RabbitMQ publisher confirm nacks.",
+		},
+	)
+	mqPublisherReconnectTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "seckill_mq_publisher_reconnect_total",
+			Help: "Total number of RabbitMQ publisher reconnect attempts.",
+		},
+	)
+	mqPublishDuration = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "seckill_mq_publish_duration_seconds",
+			Help:    "RabbitMQ publish duration in seconds.",
+			Buckets: prometheus.DefBuckets,
+		},
+	)
+)
 
 type MQPublisher struct {
 	mu       sync.Mutex
@@ -121,7 +164,17 @@ func (p *MQPublisher) closeLocked() {
 	p.returns = nil
 }
 
-func (p *MQPublisher) PublishOrder(ctx context.Context, body []byte) error {
+func (p *MQPublisher) PublishOrder(ctx context.Context, body []byte) (err error) {
+	start := time.Now()
+	defer func() {
+		mqPublishDuration.Observe(time.Since(start).Seconds())
+		if err != nil {
+			mqPublishTotal.WithLabelValues("failed").Inc()
+		} else {
+			mqPublishTotal.WithLabelValues("success").Inc()
+		}
+	}()
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -131,6 +184,8 @@ func (p *MQPublisher) PublishOrder(ctx context.Context, body []byte) error {
 		log.Printf("MQ发布失败，尝试重连后重试一次: %v", err)
 	}
 
+	mqPublishRetryTotal.Inc()
+	mqPublisherReconnectTotal.Inc()
 	if err := p.connectLocked(); err != nil {
 		return err
 	}
@@ -166,12 +221,14 @@ func (p *MQPublisher) publishLocked(ctx context.Context, body []byte) error {
 		if !ok {
 			return fmt.Errorf("RabbitMQ return channel 已关闭")
 		}
+		mqPublishReturnTotal.Inc()
 		return fmt.Errorf("消息无法路由: reply_code=%d reply_text=%s exchange=%s routing_key=%s", ret.ReplyCode, ret.ReplyText, ret.Exchange, ret.RoutingKey)
 	case confirm, ok := <-p.confirms:
 		if !ok {
 			return fmt.Errorf("RabbitMQ confirm channel 已关闭")
 		}
 		if !confirm.Ack {
+			mqPublishConfirmNackTotal.Inc()
 			return fmt.Errorf("RabbitMQ Nack delivery_tag=%d", confirm.DeliveryTag)
 		}
 		return nil

@@ -6,9 +6,15 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
+	"net/http"
+	"os"
 	"strconv"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/redis/go-redis/v9"
 	"gorm.io/driver/mysql"
@@ -82,6 +88,51 @@ type OrderMessage struct {
 
 var db *gorm.DB
 var rdb *redis.Client
+
+var (
+	dlqConsumeTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "seckill_dlq_consume_total",
+			Help: "Total number of RabbitMQ dead-letter messages handled by result.",
+		},
+		[]string{"result"},
+	)
+	dlqCompensationTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "seckill_dlq_compensation_total",
+			Help: "Total number of DLQ compensation attempts by result.",
+		},
+		[]string{"result"},
+	)
+	dlqCompensationDuration = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "seckill_dlq_compensation_duration_seconds",
+			Help:    "DLQ message handling and compensation duration in seconds.",
+			Buckets: prometheus.DefBuckets,
+		},
+	)
+	mqConsumerAckTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "seckill_mq_consumer_ack_total",
+			Help: "Total number of RabbitMQ consumer acks by queue.",
+		},
+		[]string{"queue"},
+	)
+	mqConsumerNackTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "seckill_mq_consumer_nack_total",
+			Help: "Total number of RabbitMQ consumer nacks by queue and requeue flag.",
+		},
+		[]string{"queue", "requeue"},
+	)
+	mqConsumerReconnectTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "seckill_mq_consumer_reconnect_total",
+			Help: "Total number of RabbitMQ consumer reconnect attempts by consumer.",
+		},
+		[]string{"consumer"},
+	)
+)
 
 func setupDeadQueue(ch *amqp.Channel) (amqp.Queue, error) {
 	if err := ch.ExchangeDeclare(DeadExchange, "direct", true, false, false, false, nil); err != nil {
@@ -161,40 +212,70 @@ func handleRollbackResult(code int, msg OrderMessage, d amqp.Delivery) {
 	switch code {
 	case 0:
 		log.Printf("⚠️ Redis库存Key不存在，稍后重试: order_id=%s product_id=%d", msg.OrderID, msg.ProductID)
+		dlqConsumeTotal.WithLabelValues("retry").Inc()
+		dlqCompensationTotal.WithLabelValues("retry").Inc()
+		mqConsumerNackTotal.WithLabelValues(DeadQueue, "true").Inc()
 		time.Sleep(3 * time.Second)
 		d.Nack(false, true)
 	case 1:
 		log.Printf("✅ 死信补偿成功: order_id=%s user_id=%d product_id=%d count=%d", msg.OrderID, msg.UserID, msg.ProductID, msg.Count)
+		dlqConsumeTotal.WithLabelValues("success").Inc()
+		dlqCompensationTotal.WithLabelValues("success").Inc()
+		mqConsumerAckTotal.WithLabelValues(DeadQueue).Inc()
 		d.Ack(false)
 	case 2:
 		log.Printf("❌ 死信消息数量非法，无法补偿，确认消息: order_id=%s count=%d", msg.OrderID, msg.Count)
+		dlqConsumeTotal.WithLabelValues("invalid").Inc()
+		dlqCompensationTotal.WithLabelValues("invalid").Inc()
+		mqConsumerAckTotal.WithLabelValues(DeadQueue).Inc()
 		d.Ack(false)
 	case 3:
 		log.Printf("✅ 死信已补偿过，直接确认: order_id=%s", msg.OrderID)
+		dlqConsumeTotal.WithLabelValues("success").Inc()
+		dlqCompensationTotal.WithLabelValues("already_rolled_back").Inc()
+		mqConsumerAckTotal.WithLabelValues(DeadQueue).Inc()
 		d.Ack(false)
 	case 4:
 		log.Printf("✅ 未找到用户购买记录，视为无需重复补偿: order_id=%s", msg.OrderID)
+		dlqConsumeTotal.WithLabelValues("success").Inc()
+		dlqCompensationTotal.WithLabelValues("no_purchase_record").Inc()
+		mqConsumerAckTotal.WithLabelValues(DeadQueue).Inc()
 		d.Ack(false)
 	case 5:
 		log.Printf("❌ 用户购买记录小于回滚数量，需人工核查，确认消息: order_id=%s user_id=%d count=%d", msg.OrderID, msg.UserID, msg.Count)
+		dlqConsumeTotal.WithLabelValues("manual_check").Inc()
+		dlqCompensationTotal.WithLabelValues("manual_check").Inc()
+		mqConsumerAckTotal.WithLabelValues(DeadQueue).Inc()
 		d.Ack(false)
 	default:
 		log.Printf("⚠️ 未知回滚状态，稍后重试: order_id=%s code=%d", msg.OrderID, code)
+		dlqConsumeTotal.WithLabelValues("retry").Inc()
+		dlqCompensationTotal.WithLabelValues("retry").Inc()
+		mqConsumerNackTotal.WithLabelValues(DeadQueue, "true").Inc()
 		time.Sleep(3 * time.Second)
 		d.Nack(false, true)
 	}
 }
 
 func handleMessage(d amqp.Delivery) {
+	start := time.Now()
+	defer func() {
+		dlqCompensationDuration.Observe(time.Since(start).Seconds())
+	}()
+
 	var msg OrderMessage
 	if err := json.Unmarshal(d.Body, &msg); err != nil {
 		log.Printf("❌ 死信消息格式错误，无法补偿，确认消息: %v", err)
+		dlqConsumeTotal.WithLabelValues("invalid").Inc()
+		mqConsumerAckTotal.WithLabelValues(DeadQueue).Inc()
 		d.Ack(false)
 		return
 	}
 
 	if err := validateMessage(msg); err != nil {
 		log.Printf("❌ 死信消息字段非法，无法自动补偿，确认消息: %v", err)
+		dlqConsumeTotal.WithLabelValues("invalid").Inc()
+		mqConsumerAckTotal.WithLabelValues(DeadQueue).Inc()
 		d.Ack(false)
 		return
 	}
@@ -205,12 +286,16 @@ func handleMessage(d amqp.Delivery) {
 	exists, err := orderExists(ctx, msg.OrderID)
 	if err != nil {
 		log.Printf("⚠️ 查询订单失败，稍后重试: order_id=%s err=%v", msg.OrderID, err)
+		dlqConsumeTotal.WithLabelValues("retry").Inc()
+		mqConsumerNackTotal.WithLabelValues(DeadQueue, "true").Inc()
 		time.Sleep(3 * time.Second)
 		d.Nack(false, true)
 		return
 	}
 	if exists {
 		log.Printf("✅ 订单已落库，无需回滚Redis，确认死信: order_id=%s", msg.OrderID)
+		dlqConsumeTotal.WithLabelValues("order_exists").Inc()
+		mqConsumerAckTotal.WithLabelValues(DeadQueue).Inc()
 		d.Ack(false)
 		return
 	}
@@ -218,6 +303,9 @@ func handleMessage(d amqp.Delivery) {
 	code, err := rollbackRedis(ctx, msg)
 	if err != nil {
 		log.Printf("⚠️ Redis回滚失败，稍后重试: order_id=%s err=%v", msg.OrderID, err)
+		dlqConsumeTotal.WithLabelValues("retry").Inc()
+		dlqCompensationTotal.WithLabelValues("retry").Inc()
+		mqConsumerNackTotal.WithLabelValues(DeadQueue, "true").Inc()
 		time.Sleep(3 * time.Second)
 		d.Nack(false, true)
 		return
@@ -279,10 +367,29 @@ func runConsumer(mqURL string) error {
 	}
 }
 
+func startMetricsServer() {
+	port := os.Getenv("SECKILL_DLQ_METRICS_PORT")
+	if port == "" {
+		port = "9094"
+	}
+
+	addr := net.JoinHostPort("", port)
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+
+	go func() {
+		log.Printf("DLQ Consumer metrics 已启动: %s/metrics", addr)
+		if err := http.ListenAndServe(addr, mux); err != nil {
+			log.Printf("DLQ Consumer metrics 启动失败: %v", err)
+		}
+	}()
+}
+
 func main() {
 	config.InitConfig("mq")
 	initDB()
 	initRedis()
+	startMetricsServer()
 
 	mqURL := config.Conf.MQ.URL
 	if mqURL == "" {
@@ -292,6 +399,7 @@ func main() {
 	for {
 		if err := runConsumer(mqURL); err != nil {
 			log.Printf("死信补偿消费者停止: %v，%s 后重连", err, ReconnectDelay)
+			mqConsumerReconnectTotal.WithLabelValues("dlq").Inc()
 		}
 		time.Sleep(ReconnectDelay)
 	}

@@ -5,9 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
+	"net/http"
 	"strings"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	amqp "github.com/rabbitmq/amqp091-go"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
@@ -95,6 +100,45 @@ type OrderMessage struct {
 var db *gorm.DB
 
 var errMySQLStockNotEnough = errors.New("mysql stock not enough")
+
+var (
+	mqConsumeTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "seckill_mq_consume_total",
+			Help: "Total number of RabbitMQ messages consumed by queue and result.",
+		},
+		[]string{"queue", "result"},
+	)
+	mqConsumeDuration = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "seckill_mq_consume_duration_seconds",
+			Help:    "RabbitMQ message handling duration in seconds by queue.",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"queue"},
+	)
+	mqConsumerAckTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "seckill_mq_consumer_ack_total",
+			Help: "Total number of RabbitMQ consumer acks by queue.",
+		},
+		[]string{"queue"},
+	)
+	mqConsumerNackTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "seckill_mq_consumer_nack_total",
+			Help: "Total number of RabbitMQ consumer nacks by queue and requeue flag.",
+		},
+		[]string{"queue", "requeue"},
+	)
+	mqConsumerReconnectTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "seckill_mq_consumer_reconnect_total",
+			Help: "Total number of RabbitMQ consumer reconnect attempts by consumer.",
+		},
+		[]string{"consumer"},
+	)
+)
 
 func isDuplicateOrderError(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "Duplicate entry")
@@ -196,15 +240,24 @@ func runConsumer(mqURL string) error {
 }
 
 func handleMessage(d amqp.Delivery) {
+	start := time.Now()
+	defer func() {
+		mqConsumeDuration.WithLabelValues(OrderQueue).Observe(time.Since(start).Seconds())
+	}()
+
 	var msg OrderMessage
 	if err := json.Unmarshal(d.Body, &msg); err != nil {
 		log.Printf("❌ 消息格式错误，直接丢弃: %v", err)
+		mqConsumeTotal.WithLabelValues(OrderQueue, "invalid").Inc()
+		mqConsumerNackTotal.WithLabelValues(OrderQueue, "false").Inc()
 		d.Nack(false, false) // 这种一般不需要重试，直接进死信或丢弃
 		return
 	}
 
 	if msg.Count <= 0 {
 		log.Printf("❌ 订单数量非法，进入死信: order_id=%s count=%d", msg.OrderID, msg.Count)
+		mqConsumeTotal.WithLabelValues(OrderQueue, "invalid").Inc()
+		mqConsumerNackTotal.WithLabelValues(OrderQueue, "false").Inc()
 		d.Nack(false, false)
 		return
 	}
@@ -221,27 +274,54 @@ func handleMessage(d amqp.Delivery) {
 		if isDuplicateOrderError(err) {
 			fmt.Printf(" -> ⚠️ 订单已存在，确认消息\n")
 			// 事务已回滚，避免重复扣减 product.stock。
+			mqConsumeTotal.WithLabelValues(OrderQueue, "duplicate").Inc()
+			mqConsumerAckTotal.WithLabelValues(OrderQueue).Inc()
 			d.Ack(false)
 		} else if errors.Is(err, errMySQLStockNotEnough) {
 			log.Printf(" -> ❌ MySQL库存不足，发送 Nack(不重回队列)->进入死信")
+			mqConsumeTotal.WithLabelValues(OrderQueue, "mysql_stock_not_enough").Inc()
+			mqConsumerNackTotal.WithLabelValues(OrderQueue, "false").Inc()
 			d.Nack(false, false)
 		} else {
 			// 场景 B: 真正的故障 (数据库挂了/网络抖动)
 			log.Printf(" -> ❌ 落库失败: %v，发送 Nack(不重回队列)->进入死信", err)
 
 			// 关键点：requeue=false + 配置了死信交换机 = 消息进入死信队列
+			mqConsumeTotal.WithLabelValues(OrderQueue, "failed").Inc()
+			mqConsumerNackTotal.WithLabelValues(OrderQueue, "false").Inc()
 			d.Nack(false, false)
 		}
 	} else {
 		// 场景 C: 成功
 		fmt.Printf(" -> ✅ 落库成功\n")
+		mqConsumeTotal.WithLabelValues(OrderQueue, "success").Inc()
+		mqConsumerAckTotal.WithLabelValues(OrderQueue).Inc()
 		d.Ack(false)
 	}
+}
+
+func startMetricsServer() {
+	port := config.Conf.Server.MetricsPort
+	if port == "" {
+		port = "9093"
+	}
+
+	addr := net.JoinHostPort("", port)
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+
+	go func() {
+		log.Printf("MQ Consumer metrics 已启动: %s/metrics", addr)
+		if err := http.ListenAndServe(addr, mux); err != nil {
+			log.Printf("MQ Consumer metrics 启动失败: %v", err)
+		}
+	}()
 }
 
 func main() {
 	config.InitConfig("mq")
 	initDB()
+	startMetricsServer()
 	mqURL := config.Conf.MQ.URL
 	if mqURL == "" {
 		log.Fatal("mq.url 为空，请在 config/mq.yaml 设置或通过环境变量 SECKILL_MQ_URL 注入")
@@ -250,6 +330,7 @@ func main() {
 	for {
 		if err := runConsumer(mqURL); err != nil {
 			log.Printf("主队列消费者停止: %v，%s 后重连", err, ReconnectDelay)
+			mqConsumerReconnectTotal.WithLabelValues("order").Inc()
 		}
 		time.Sleep(ReconnectDelay)
 	}
