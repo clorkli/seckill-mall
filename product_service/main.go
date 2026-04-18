@@ -63,6 +63,29 @@ redis.call("hincrby", KEYS[2], ARGV[2], want_buy) --记录用户购买行为
 return 1
 `
 
+// 回滚脚本同时恢复库存和用户购买记录，避免 MQ 发送失败后用户被误判已购买。
+const ROLLBACK_LUA_SCRIPT = `
+if redis.call("EXISTS", KEYS[1]) == 0 then
+	return 0
+end
+
+local rollback_count = tonumber(ARGV[1])
+if rollback_count <= 0 then
+	return 2
+end
+
+redis.call("incrby", KEYS[1], rollback_count)
+
+local current_buy = tonumber(redis.call("hget", KEYS[2], ARGV[2])) or 0
+if current_buy <= rollback_count then
+	redis.call("hdel", KEYS[2], ARGV[2])
+else
+	redis.call("hincrby", KEYS[2], ARGV[2], -rollback_count)
+end
+
+return 1
+`
+
 // 升级 DeductStock 接口，区分库存为零与商品不存在两种情况
 func (s *server) DeductStock(ctx context.Context, req *pb.DeductStockRequest) (*pb.DeductStockResponse, error) {
 	fmt.Printf("[Trace]扣减库存：用户%d, 商品%d, 数量%d\n", req.UserId, req.ProductId, req.Count)
@@ -122,19 +145,35 @@ func (s *server) DeductStock(ctx context.Context, req *pb.DeductStockRequest) (*
 
 // 实现 RollbackStock 接口
 func (s *server) RollbackStock(ctx context.Context, req *pb.DeductStockRequest) (*pb.DeductStockResponse, error) {
-	fmt.Printf("[Rollback]收到回滚请求：商品%d, 数量%d\n", req.ProductId, req.Count)
+	fmt.Printf("[Rollback]收到回滚请求：用户%d, 商品%d, 数量%d\n", req.UserId, req.ProductId, req.Count)
 
-	key := "product:stock:" + strconv.FormatInt(req.ProductId, 10)
+	if req.Count <= 0 {
+		return &pb.DeductStockResponse{
+			Success: false,
+			Message: "回滚数量必须大于0",
+		}, nil
+	}
 
-	//使用Redis的INCRBY原子操作回滚库存
-	err := rdb.IncrBy(ctx, key, int64(req.Count)).Err()
+	stockKey := "product:stock:" + strconv.FormatInt(req.ProductId, 10)
+	userSetKey := "product:users:" + strconv.FormatInt(req.ProductId, 10)
+
+	val, err := rdb.Eval(ctx, ROLLBACK_LUA_SCRIPT, []string{stockKey, userSetKey}, req.Count, req.UserId).Int()
 	if err != nil {
 		fmt.Printf("X! 回滚失败，CRITICAL ERROR：%v\n", err)
 		return &pb.DeductStockResponse{Success: false, Message: "回滚失败: " + err.Error()}, nil
 	}
 
-	fmt.Printf("回滚成功，库存已恢复\n")
-	return &pb.DeductStockResponse{Success: true, Message: "回滚成功"}, nil
+	switch val {
+	case 0:
+		return &pb.DeductStockResponse{Success: false, Message: "商品库存不存在，无法回滚"}, nil
+	case 1:
+		fmt.Printf("回滚成功，库存和用户购买记录已恢复\n")
+		return &pb.DeductStockResponse{Success: true, Message: "回滚成功"}, nil
+	case 2:
+		return &pb.DeductStockResponse{Success: false, Message: "回滚数量必须大于0"}, nil
+	default:
+		return &pb.DeductStockResponse{Success: false, Message: "未知回滚状态"}, nil
+	}
 }
 
 // 数据库模型

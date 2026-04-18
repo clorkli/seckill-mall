@@ -119,13 +119,16 @@ func (s *server) CreateOrder(ctx context.Context, req *pb.CreateOrderRequest) (*
 		rollbackCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 
-		_, errRb := productClient.RollbackStock(rollbackCtx, &pb.DeductStockRequest{
+		rollbackResp, errRb := productClient.RollbackStock(rollbackCtx, &pb.DeductStockRequest{
 			ProductId: req.ProductId,
 			Count:     req.Count,
+			UserId:    req.UserId,
 		})
 
 		if errRb != nil {
 			log.Printf("X! MQ发送失败且回滚库存失败，请人工介入，CRITICAL ERROR: %v", errRb)
+		} else if !rollbackResp.Success {
+			log.Printf("X! MQ发送失败且回滚库存失败，请人工介入，CRITICAL ERROR: %s", rollbackResp.Message)
 		} else {
 			log.Printf("库存回滚成功")
 		}
