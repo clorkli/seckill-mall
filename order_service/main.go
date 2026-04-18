@@ -28,6 +28,8 @@ import (
 
 	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
 	otelgrpc "go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/codes"
 )
 
 const (
@@ -164,7 +166,7 @@ func (p *MQPublisher) closeLocked() {
 	p.returns = nil
 }
 
-func (p *MQPublisher) PublishOrder(ctx context.Context, body []byte) (err error) {
+func (p *MQPublisher) PublishOrder(ctx context.Context, body []byte, headers amqp.Table) (err error) {
 	start := time.Now()
 	defer func() {
 		mqPublishDuration.Observe(time.Since(start).Seconds())
@@ -178,7 +180,7 @@ func (p *MQPublisher) PublishOrder(ctx context.Context, body []byte) (err error)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if err := p.publishLocked(ctx, body); err == nil {
+	if err := p.publishLocked(ctx, body, headers); err == nil {
 		return nil
 	} else {
 		log.Printf("MQ发布失败，尝试重连后重试一次: %v", err)
@@ -190,10 +192,10 @@ func (p *MQPublisher) PublishOrder(ctx context.Context, body []byte) (err error)
 		return err
 	}
 
-	return p.publishLocked(ctx, body)
+	return p.publishLocked(ctx, body, headers)
 }
 
-func (p *MQPublisher) publishLocked(ctx context.Context, body []byte) error {
+func (p *MQPublisher) publishLocked(ctx context.Context, body []byte, headers amqp.Table) error {
 	if p.channel == nil {
 		if err := p.connectLocked(); err != nil {
 			return err
@@ -209,6 +211,7 @@ func (p *MQPublisher) publishLocked(ctx context.Context, body []byte) error {
 		amqp.Publishing{
 			ContentType:  "application/json",
 			DeliveryMode: amqp.Persistent,
+			Headers:      headers,
 			Timestamp:    time.Now(),
 			Body:         body,
 		},
@@ -293,15 +296,25 @@ func (s *server) CreateOrder(ctx context.Context, req *pb.CreateOrderRequest) (*
 	}
 
 	// 发送消息到 RabbitMQ
+	publishTraceCtx, publishSpan := otel.Tracer("order-service").Start(ctx, "rabbitmq.publish_order")
+	headers := tracer.InjectAMQPHeaders(publishTraceCtx, nil)
+	defer publishSpan.End()
+
 	publishCtx, cancelPublish := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelPublish()
 
-	err = mqPublisher.PublishOrder(publishCtx, body)
+	err = mqPublisher.PublishOrder(publishCtx, body, headers)
 
 	//发MQ失败应该回滚Redis库存，这里先打日志
 	if err != nil {
+		publishSpan.RecordError(err)
+		publishSpan.SetStatus(codes.Error, "publish order message failed")
 		log.Printf("发送MQ失败: %v，正在执行回滚...", err)
+	} else {
+		publishSpan.SetStatus(codes.Ok, "publish order message confirmed")
+	}
 
+	if err != nil {
 		//使用新Context避免因超时导致回滚被取消
 		rollbackCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()

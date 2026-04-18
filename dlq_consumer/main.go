@@ -21,6 +21,11 @@ import (
 	"gorm.io/gorm"
 
 	"seckill-mall/common/config"
+	"seckill-mall/common/tracer"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -208,10 +213,11 @@ func rollbackRedis(ctx context.Context, msg OrderMessage) (int, error) {
 	return rdb.Eval(ctx, ROLLBACK_LUA_SCRIPT, []string{stockKey, userSetKey, rollbackKey}, msg.Count, msg.UserID).Int()
 }
 
-func handleRollbackResult(code int, msg OrderMessage, d amqp.Delivery) {
+func handleRollbackResult(code int, msg OrderMessage, d amqp.Delivery, span trace.Span) {
 	switch code {
 	case 0:
 		log.Printf("⚠️ Redis库存Key不存在，稍后重试: order_id=%s product_id=%d", msg.OrderID, msg.ProductID)
+		span.SetStatus(codes.Error, "redis stock key missing")
 		dlqConsumeTotal.WithLabelValues("retry").Inc()
 		dlqCompensationTotal.WithLabelValues("retry").Inc()
 		mqConsumerNackTotal.WithLabelValues(DeadQueue, "true").Inc()
@@ -219,36 +225,42 @@ func handleRollbackResult(code int, msg OrderMessage, d amqp.Delivery) {
 		d.Nack(false, true)
 	case 1:
 		log.Printf("✅ 死信补偿成功: order_id=%s user_id=%d product_id=%d count=%d", msg.OrderID, msg.UserID, msg.ProductID, msg.Count)
+		span.SetStatus(codes.Ok, "dlq compensation succeeded")
 		dlqConsumeTotal.WithLabelValues("success").Inc()
 		dlqCompensationTotal.WithLabelValues("success").Inc()
 		mqConsumerAckTotal.WithLabelValues(DeadQueue).Inc()
 		d.Ack(false)
 	case 2:
 		log.Printf("❌ 死信消息数量非法，无法补偿，确认消息: order_id=%s count=%d", msg.OrderID, msg.Count)
+		span.SetStatus(codes.Error, "invalid rollback count")
 		dlqConsumeTotal.WithLabelValues("invalid").Inc()
 		dlqCompensationTotal.WithLabelValues("invalid").Inc()
 		mqConsumerAckTotal.WithLabelValues(DeadQueue).Inc()
 		d.Ack(false)
 	case 3:
 		log.Printf("✅ 死信已补偿过，直接确认: order_id=%s", msg.OrderID)
+		span.SetStatus(codes.Ok, "already rolled back")
 		dlqConsumeTotal.WithLabelValues("success").Inc()
 		dlqCompensationTotal.WithLabelValues("already_rolled_back").Inc()
 		mqConsumerAckTotal.WithLabelValues(DeadQueue).Inc()
 		d.Ack(false)
 	case 4:
 		log.Printf("✅ 未找到用户购买记录，视为无需重复补偿: order_id=%s", msg.OrderID)
+		span.SetStatus(codes.Ok, "no purchase record")
 		dlqConsumeTotal.WithLabelValues("success").Inc()
 		dlqCompensationTotal.WithLabelValues("no_purchase_record").Inc()
 		mqConsumerAckTotal.WithLabelValues(DeadQueue).Inc()
 		d.Ack(false)
 	case 5:
 		log.Printf("❌ 用户购买记录小于回滚数量，需人工核查，确认消息: order_id=%s user_id=%d count=%d", msg.OrderID, msg.UserID, msg.Count)
+		span.SetStatus(codes.Error, "manual check required")
 		dlqConsumeTotal.WithLabelValues("manual_check").Inc()
 		dlqCompensationTotal.WithLabelValues("manual_check").Inc()
 		mqConsumerAckTotal.WithLabelValues(DeadQueue).Inc()
 		d.Ack(false)
 	default:
 		log.Printf("⚠️ 未知回滚状态，稍后重试: order_id=%s code=%d", msg.OrderID, code)
+		span.SetStatus(codes.Error, "unknown rollback status")
 		dlqConsumeTotal.WithLabelValues("retry").Inc()
 		dlqCompensationTotal.WithLabelValues("retry").Inc()
 		mqConsumerNackTotal.WithLabelValues(DeadQueue, "true").Inc()
@@ -263,9 +275,15 @@ func handleMessage(d amqp.Delivery) {
 		dlqCompensationDuration.Observe(time.Since(start).Seconds())
 	}()
 
+	traceCtx := tracer.ExtractAMQPHeaders(context.Background(), d.Headers)
+	traceCtx, span := otel.Tracer("dlq-consumer").Start(traceCtx, "rabbitmq.consume_dlq")
+	defer span.End()
+
 	var msg OrderMessage
 	if err := json.Unmarshal(d.Body, &msg); err != nil {
 		log.Printf("❌ 死信消息格式错误，无法补偿，确认消息: %v", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "invalid dlq message json")
 		dlqConsumeTotal.WithLabelValues("invalid").Inc()
 		mqConsumerAckTotal.WithLabelValues(DeadQueue).Inc()
 		d.Ack(false)
@@ -274,18 +292,22 @@ func handleMessage(d amqp.Delivery) {
 
 	if err := validateMessage(msg); err != nil {
 		log.Printf("❌ 死信消息字段非法，无法自动补偿，确认消息: %v", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "invalid dlq message fields")
 		dlqConsumeTotal.WithLabelValues("invalid").Inc()
 		mqConsumerAckTotal.WithLabelValues(DeadQueue).Inc()
 		d.Ack(false)
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(traceCtx, 5*time.Second)
 	defer cancel()
 
 	exists, err := orderExists(ctx, msg.OrderID)
 	if err != nil {
 		log.Printf("⚠️ 查询订单失败，稍后重试: order_id=%s err=%v", msg.OrderID, err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "query order failed")
 		dlqConsumeTotal.WithLabelValues("retry").Inc()
 		mqConsumerNackTotal.WithLabelValues(DeadQueue, "true").Inc()
 		time.Sleep(3 * time.Second)
@@ -294,6 +316,7 @@ func handleMessage(d amqp.Delivery) {
 	}
 	if exists {
 		log.Printf("✅ 订单已落库，无需回滚Redis，确认死信: order_id=%s", msg.OrderID)
+		span.SetStatus(codes.Ok, "order already exists")
 		dlqConsumeTotal.WithLabelValues("order_exists").Inc()
 		mqConsumerAckTotal.WithLabelValues(DeadQueue).Inc()
 		d.Ack(false)
@@ -303,6 +326,8 @@ func handleMessage(d amqp.Delivery) {
 	code, err := rollbackRedis(ctx, msg)
 	if err != nil {
 		log.Printf("⚠️ Redis回滚失败，稍后重试: order_id=%s err=%v", msg.OrderID, err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "redis rollback failed")
 		dlqConsumeTotal.WithLabelValues("retry").Inc()
 		dlqCompensationTotal.WithLabelValues("retry").Inc()
 		mqConsumerNackTotal.WithLabelValues(DeadQueue, "true").Inc()
@@ -311,7 +336,7 @@ func handleMessage(d amqp.Delivery) {
 		return
 	}
 
-	handleRollbackResult(code, msg, d)
+	handleRollbackResult(code, msg, d, span)
 }
 
 func runConsumer(mqURL string) error {
@@ -386,6 +411,9 @@ func startMetricsServer() {
 }
 
 func main() {
+	shutdown := tracer.InitTracer("dlq-consumer", "localhost:4318")
+	defer shutdown(context.Background())
+
 	config.InitConfig("mq")
 	initDB()
 	initRedis()

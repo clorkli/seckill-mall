@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +19,10 @@ import (
 	"gorm.io/gorm"
 
 	"seckill-mall/common/config"
+	"seckill-mall/common/tracer"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/codes"
 )
 
 const (
@@ -144,7 +149,7 @@ func isDuplicateOrderError(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "Duplicate entry")
 }
 
-func persistOrder(msg OrderMessage) error {
+func persistOrder(ctx context.Context, msg OrderMessage) error {
 	order := Order{
 		OrderID:   msg.OrderID,
 		UserID:    msg.UserID,
@@ -153,7 +158,7 @@ func persistOrder(msg OrderMessage) error {
 		Status:    1, // 已支付/处理中
 	}
 
-	return db.Transaction(func(tx *gorm.DB) error {
+	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(&order).Error; err != nil {
 			return err
 		}
@@ -245,9 +250,15 @@ func handleMessage(d amqp.Delivery) {
 		mqConsumeDuration.WithLabelValues(OrderQueue).Observe(time.Since(start).Seconds())
 	}()
 
+	traceCtx := tracer.ExtractAMQPHeaders(context.Background(), d.Headers)
+	traceCtx, span := otel.Tracer("mq-consumer").Start(traceCtx, "rabbitmq.consume_order")
+	defer span.End()
+
 	var msg OrderMessage
 	if err := json.Unmarshal(d.Body, &msg); err != nil {
 		log.Printf("❌ 消息格式错误，直接丢弃: %v", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "invalid message json")
 		mqConsumeTotal.WithLabelValues(OrderQueue, "invalid").Inc()
 		mqConsumerNackTotal.WithLabelValues(OrderQueue, "false").Inc()
 		d.Nack(false, false) // 这种一般不需要重试，直接进死信或丢弃
@@ -256,6 +267,7 @@ func handleMessage(d amqp.Delivery) {
 
 	if msg.Count <= 0 {
 		log.Printf("❌ 订单数量非法，进入死信: order_id=%s count=%d", msg.OrderID, msg.Count)
+		span.SetStatus(codes.Error, "invalid order count")
 		mqConsumeTotal.WithLabelValues(OrderQueue, "invalid").Inc()
 		mqConsumerNackTotal.WithLabelValues(OrderQueue, "false").Inc()
 		d.Nack(false, false)
@@ -268,23 +280,28 @@ func handleMessage(d amqp.Delivery) {
 	time.Sleep(50 * time.Millisecond)
 
 	// 写入订单并同步扣减 MySQL 商品库存，保证最终库存账本一致。
-	err := persistOrder(msg)
+	err := persistOrder(traceCtx, msg)
 	if err != nil {
 		// 场景 A: 重复消费 (幂等性保护)
 		if isDuplicateOrderError(err) {
 			fmt.Printf(" -> ⚠️ 订单已存在，确认消息\n")
+			span.SetStatus(codes.Ok, "duplicate order acknowledged")
 			// 事务已回滚，避免重复扣减 product.stock。
 			mqConsumeTotal.WithLabelValues(OrderQueue, "duplicate").Inc()
 			mqConsumerAckTotal.WithLabelValues(OrderQueue).Inc()
 			d.Ack(false)
 		} else if errors.Is(err, errMySQLStockNotEnough) {
 			log.Printf(" -> ❌ MySQL库存不足，发送 Nack(不重回队列)->进入死信")
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "mysql stock not enough")
 			mqConsumeTotal.WithLabelValues(OrderQueue, "mysql_stock_not_enough").Inc()
 			mqConsumerNackTotal.WithLabelValues(OrderQueue, "false").Inc()
 			d.Nack(false, false)
 		} else {
 			// 场景 B: 真正的故障 (数据库挂了/网络抖动)
 			log.Printf(" -> ❌ 落库失败: %v，发送 Nack(不重回队列)->进入死信", err)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "persist order failed")
 
 			// 关键点：requeue=false + 配置了死信交换机 = 消息进入死信队列
 			mqConsumeTotal.WithLabelValues(OrderQueue, "failed").Inc()
@@ -294,6 +311,7 @@ func handleMessage(d amqp.Delivery) {
 	} else {
 		// 场景 C: 成功
 		fmt.Printf(" -> ✅ 落库成功\n")
+		span.SetStatus(codes.Ok, "order persisted")
 		mqConsumeTotal.WithLabelValues(OrderQueue, "success").Inc()
 		mqConsumerAckTotal.WithLabelValues(OrderQueue).Inc()
 		d.Ack(false)
@@ -319,6 +337,9 @@ func startMetricsServer() {
 }
 
 func main() {
+	shutdown := tracer.InitTracer("mq-consumer", "localhost:4318")
+	defer shutdown(context.Background())
+
 	config.InitConfig("mq")
 	initDB()
 	startMetricsServer()
