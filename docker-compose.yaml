@@ -7,10 +7,14 @@ services:
     ports:
       - "6379:6379"
     restart: always
+    volumes:
+      - redis_data:/data
     command:
-        - redis-server
-        - --requirepass
-        - "123456"
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --requirepass
+      - "123456"
 
   rabbitmq:
     image: rabbitmq:3-management
@@ -80,4 +84,5 @@ services:
       - etcd_data:/etcd-data
 
 volumes:
+  redis_data:
   etcd_data:

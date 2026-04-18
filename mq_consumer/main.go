@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -85,10 +86,48 @@ type OrderMessage struct {
 	OrderID   string  `json:"order_id"`
 	UserID    int64   `json:"user_id"`
 	ProductID int64   `json:"product_id"`
+	Count     int32   `json:"count"`
 	Amount    float32 `json:"amount"`
 }
 
 var db *gorm.DB
+
+var errMySQLStockNotEnough = errors.New("mysql stock not enough")
+
+func isDuplicateOrderError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "Duplicate entry")
+}
+
+func persistOrder(msg OrderMessage) error {
+	order := Order{
+		OrderID:   msg.OrderID,
+		UserID:    msg.UserID,
+		ProductID: msg.ProductID,
+		Amount:    msg.Amount,
+		Status:    1, // 已支付/处理中
+	}
+
+	return db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&order).Error; err != nil {
+			return err
+		}
+
+		result := tx.Exec(
+			"UPDATE product SET stock = stock - ? WHERE id = ? AND stock >= ?",
+			msg.Count,
+			msg.ProductID,
+			msg.Count,
+		)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return errMySQLStockNotEnough
+		}
+
+		return nil
+	})
+}
 
 func main() {
 	config.InitConfig("mq")
@@ -143,27 +182,28 @@ func main() {
 				continue
 			}
 
-			fmt.Printf("📦 接收订单: %s | 金额：%.2f | 处理中...", msg.OrderID, msg.Amount)
-
-			// 构造数据库对象（适配你的表结构）
-			order := Order{
-				OrderID:   msg.OrderID,
-				UserID:    msg.UserID,
-				ProductID: msg.ProductID,
-				Amount:    msg.Amount,
-				Status:    1, // 已支付/处理中
+			if msg.Count <= 0 {
+				log.Printf("❌ 订单数量非法，进入死信: order_id=%s count=%d", msg.OrderID, msg.Count)
+				d.Nack(false, false)
+				continue
 			}
+
+			fmt.Printf("📦 接收订单: %s | 数量：%d | 金额：%.2f | 处理中...", msg.OrderID, msg.Count, msg.Amount)
 
 			// 模拟业务处理耗时
 			time.Sleep(50 * time.Millisecond)
 
-			// 写入数据库
-			err = db.Create(&order).Error
+			// 写入订单并同步扣减 MySQL 商品库存，保证最终库存账本一致。
+			err = persistOrder(msg)
 			if err != nil {
 				// 场景 A: 重复消费 (幂等性保护)
-				if strings.Contains(err.Error(), "Duplicate entry") {
+				if isDuplicateOrderError(err) {
 					fmt.Printf(" -> ⚠️ 订单已存在，确认消息\n")
+					// 事务已回滚，避免重复扣减 product.stock。
 					d.Ack(false)
+				} else if errors.Is(err, errMySQLStockNotEnough) {
+					log.Printf(" -> ❌ MySQL库存不足，发送 Nack(不重回队列)->进入死信")
+					d.Nack(false, false)
 				} else {
 					// 场景 B: 真正的故障 (数据库挂了/网络抖动)
 					log.Printf(" -> ❌ 落库失败: %v，发送 Nack(不重回队列)->进入死信", err)

@@ -42,6 +42,7 @@ type OrderMessage struct {
 	OrderID   string  `json:"order_id"`
 	UserID    int64   `json:"user_id"`
 	ProductID int64   `json:"product_id"`
+	Count     int32   `json:"count"`
 	Amount    float32 `json:"amount"`
 }
 
@@ -94,6 +95,7 @@ func (s *server) CreateOrder(ctx context.Context, req *pb.CreateOrderRequest) (*
 		OrderID:   orderID,
 		UserID:    req.UserId,
 		ProductID: req.ProductId,
+		Count:     req.Count,
 		Amount:    totalAmount,
 	}
 
