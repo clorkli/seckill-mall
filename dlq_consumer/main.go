@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strconv"
@@ -20,6 +21,8 @@ const (
 	DeadExchange   = "dlx_exchange"
 	DeadQueue      = "dead_queue"
 	DeadRoutingKey = "dead_key"
+
+	ReconnectDelay = 3 * time.Second
 )
 
 const ROLLBACK_LUA_SCRIPT = `
@@ -80,21 +83,21 @@ type OrderMessage struct {
 var db *gorm.DB
 var rdb *redis.Client
 
-func setupDeadQueue(ch *amqp.Channel) amqp.Queue {
+func setupDeadQueue(ch *amqp.Channel) (amqp.Queue, error) {
 	if err := ch.ExchangeDeclare(DeadExchange, "direct", true, false, false, false, nil); err != nil {
-		log.Fatalf("声明死信交换机失败: %v", err)
+		return amqp.Queue{}, fmt.Errorf("声明死信交换机失败: %w", err)
 	}
 
 	q, err := ch.QueueDeclare(DeadQueue, true, false, false, false, nil)
 	if err != nil {
-		log.Fatalf("声明死信队列失败: %v", err)
+		return amqp.Queue{}, fmt.Errorf("声明死信队列失败: %w", err)
 	}
 
 	if err := ch.QueueBind(DeadQueue, DeadRoutingKey, DeadExchange, false, nil); err != nil {
-		log.Fatalf("绑定死信队列失败: %v", err)
+		return amqp.Queue{}, fmt.Errorf("绑定死信队列失败: %w", err)
 	}
 
-	return q
+	return q, nil
 }
 
 func initDB() {
@@ -223,6 +226,59 @@ func handleMessage(d amqp.Delivery) {
 	handleRollbackResult(code, msg, d)
 }
 
+func runConsumer(mqURL string) error {
+	conn, err := amqp.Dial(mqURL)
+	if err != nil {
+		return fmt.Errorf("连接RabbitMQ失败: %w", err)
+	}
+	defer conn.Close()
+
+	ch, err := conn.Channel()
+	if err != nil {
+		return fmt.Errorf("创建MQ通道失败: %w", err)
+	}
+	defer ch.Close()
+
+	if err := ch.Qos(1, 0, false); err != nil {
+		return fmt.Errorf("设置Qos失败: %w", err)
+	}
+
+	q, err := setupDeadQueue(ch)
+	if err != nil {
+		return err
+	}
+
+	msgs, err := ch.Consume(q.Name, "", false, false, false, false, nil)
+	if err != nil {
+		return fmt.Errorf("启动死信消费失败: %w", err)
+	}
+
+	fmt.Println("🛠️ 死信补偿服务已启动，等待 dead_queue 消息...")
+
+	connClosed := conn.NotifyClose(make(chan *amqp.Error, 1))
+	chClosed := ch.NotifyClose(make(chan *amqp.Error, 1))
+
+	for {
+		select {
+		case d, ok := <-msgs:
+			if !ok {
+				return errors.New("RabbitMQ dead_queue delivery channel 已关闭")
+			}
+			handleMessage(d)
+		case err, ok := <-connClosed:
+			if !ok || err == nil {
+				return errors.New("RabbitMQ connection 已关闭")
+			}
+			return fmt.Errorf("RabbitMQ connection 异常关闭: %w", err)
+		case err, ok := <-chClosed:
+			if !ok || err == nil {
+				return errors.New("RabbitMQ channel 已关闭")
+			}
+			return fmt.Errorf("RabbitMQ channel 异常关闭: %w", err)
+		}
+	}
+}
+
 func main() {
 	config.InitConfig("mq")
 	initDB()
@@ -233,37 +289,10 @@ func main() {
 		log.Fatal("mq.url 为空，请在 config/mq.yaml 设置或通过环境变量 SECKILL_MQ_URL 注入")
 	}
 
-	conn, err := amqp.Dial(mqURL)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer conn.Close()
-
-	ch, err := conn.Channel()
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer ch.Close()
-
-	if err := ch.Qos(1, 0, false); err != nil {
-		log.Fatalf("设置Qos失败: %v", err)
-	}
-
-	q := setupDeadQueue(ch)
-
-	msgs, err := ch.Consume(q.Name, "", false, false, false, false, nil)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	fmt.Println("🛠️ 死信补偿服务已启动，等待 dead_queue 消息...")
-
-	forever := make(chan struct{})
-	go func() {
-		for d := range msgs {
-			handleMessage(d)
+	for {
+		if err := runConsumer(mqURL); err != nil {
+			log.Printf("死信补偿消费者停止: %v，%s 后重连", err, ReconnectDelay)
 		}
-	}()
-
-	<-forever
+		time.Sleep(ReconnectDelay)
+	}
 }

@@ -24,6 +24,7 @@
 - DLQ Consumer 会消费死信队列，先检查 MySQL 订单是否已存在，未落库才执行 Redis 补偿。
 - Order Service 发布订单消息时已启用 publisher confirm、mandatory 路由检查和消息持久化。
 - Order Service 发送 MQ 失败时会重建 RabbitMQ 连接和 Channel，并自动重试一次。
+- MQ Consumer 和 DLQ Consumer 已支持 RabbitMQ connection/channel 断开后的自动重连和重新消费。
 - MQ Consumer 在 MySQL 事务中写入 `orders` 并扣减 `product.stock`，让 MySQL 成为最终库存账本。
 - Redis 已开启 AOF，并通过 Docker volume 持久化 `/data`，降低容器重启后的库存丢失风险。
 - 接入 OpenTelemetry + Jaeger 做链路追踪。
@@ -250,23 +251,22 @@ WHERE id = 1;
 - `dlq_consumer` 对旧格式或字段缺失的死信消息无法自动补偿，会记录日志并确认消息，避免毒丸消息阻塞队列。
 - Product Service 在 `debug` 模式下会启用 `/dev/reset`，该接口会清空 Redis 和 `orders` 表，但当前不会自动恢复 `product.stock` 到初始值。
 - DLQ Consumer 已支持常见落库失败后的 Redis 补偿，但对用户购买记录小于回滚数量等异常状态仍需要人工核查日志。
-- RabbitMQ 生产者侧已启用 publisher confirm、persistent message、mandatory return 和失败重连重试；Consumer 侧暂未做自动重连。
+- RabbitMQ 生产者侧已启用 publisher confirm、persistent message、mandatory return 和失败重连重试；Consumer 侧已支持连接断开后自动重连。
 - etcd 注册地址当前偏本地开发场景，服务地址仍以 `127.0.0.1` 为主，多机或容器化部署需要调整。
 
 ## 继续优化方向
 
 建议按优先级继续推进：
 
-1. 完善 MQ 可观测性：增加 publish confirm 成功率、publish retry 次数、return message、Consumer Nack、DLQ 补偿结果等指标和告警。
-2. 增强 Consumer 可靠性：为 `mq_consumer` 和 `dlq_consumer` 增加连接断开后的自动重连与重新消费。
-3. 引入 Outbox 模式：进一步降低“Redis 已扣减但 MQ 确认状态不明”这类分布式边界风险。
-4. 修复开发重置能力：让 `/dev/reset` 同步恢复 `product.stock` 到测试初始库存，或改成显式传入重置库存。
-5. 抽离订单状态：引入订单状态机，例如排队中、已创建、失败、已取消，避免只依赖 MQ 成功与否判断订单结果。
-6. 增加查询接口：增加订单查询接口，用户下单后可以查询异步处理结果。
-7. 改善服务注册：etcd 注册地址改为可配置，支持 Docker、WSL、多机部署场景。
-8. 增加自动化测试：补充 Redis Lua、库存回滚、Consumer 幂等、MySQL 事务扣库存、DLQ 补偿、MQ 发布确认等核心测试。
-9. 增加数据库迁移：引入 migration 工具管理 schema，避免 README 中手工 SQL 与代码模型漂移。
-10. 完善配置加载与安全边界：支持更多环境变量覆盖，关闭生产环境 `/dev/reset`，JWT secret 强度校验，敏感日志脱敏。
+1. 完善 MQ 可观测性：增加 publish confirm 成功率、publish retry 次数、return message、Consumer Nack、DLQ 补偿结果、Consumer reconnect 次数等指标和告警。
+2. 引入 Outbox 模式：进一步降低“Redis 已扣减但 MQ 确认状态不明”这类分布式边界风险。
+3. 修复开发重置能力：让 `/dev/reset` 同步恢复 `product.stock` 到测试初始库存，或改成显式传入重置库存。
+4. 抽离订单状态：引入订单状态机，例如排队中、已创建、失败、已取消，避免只依赖 MQ 成功与否判断订单结果。
+5. 增加查询接口：增加订单查询接口，用户下单后可以查询异步处理结果。
+6. 改善服务注册：etcd 注册地址改为可配置，支持 Docker、WSL、多机部署场景。
+7. 增加自动化测试：补充 Redis Lua、库存回滚、Consumer 幂等、MySQL 事务扣库存、DLQ 补偿、MQ 发布确认和消费端重连等核心测试。
+8. 增加数据库迁移：引入 migration 工具管理 schema，避免 README 中手工 SQL 与代码模型漂移。
+9. 完善配置加载与安全边界：支持更多环境变量覆盖，关闭生产环境 `/dev/reset`，JWT secret 强度校验，敏感日志脱敏。
 
 ## 技术栈
 
