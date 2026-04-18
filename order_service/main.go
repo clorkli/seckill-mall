@@ -7,6 +7,8 @@ import (
 	"log"
 	"math/rand"
 	"net"
+	"net/http"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -21,8 +23,6 @@ import (
 	"seckill-mall/common/config"
 	"seckill-mall/common/pb"
 	"seckill-mall/common/tracer"
-
-	"net/http"
 
 	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
 	otelgrpc "go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
@@ -47,7 +47,138 @@ type OrderMessage struct {
 }
 
 var productClient pb.ProductServiceClient
-var mqChannel *amqp.Channel //全局MQ通道
+var mqPublisher *MQPublisher
+
+type MQPublisher struct {
+	mu       sync.Mutex
+	url      string
+	conn     *amqp.Connection
+	channel  *amqp.Channel
+	confirms <-chan amqp.Confirmation
+	returns  <-chan amqp.Return
+}
+
+func NewMQPublisher(url string) *MQPublisher {
+	return &MQPublisher{url: url}
+}
+
+func (p *MQPublisher) Connect() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.connectLocked()
+}
+
+func (p *MQPublisher) connectLocked() error {
+	p.closeLocked()
+
+	conn, err := amqp.Dial(p.url)
+	if err != nil {
+		return fmt.Errorf("连接RabbitMQ失败: %w", err)
+	}
+
+	ch, err := conn.Channel()
+	if err != nil {
+		conn.Close()
+		return fmt.Errorf("创建MQ通道失败: %w", err)
+	}
+
+	args := amqp.Table{
+		"x-dead-letter-exchange":    DeadExchange,
+		"x-dead-letter-routing-key": DeadRoutingKey,
+	}
+
+	if _, err := ch.QueueDeclare(MQ_QUEUE_NAME, true, false, false, false, args); err != nil {
+		ch.Close()
+		conn.Close()
+		return fmt.Errorf("声明队列失败: %w", err)
+	}
+
+	if err := ch.Confirm(false); err != nil {
+		ch.Close()
+		conn.Close()
+		return fmt.Errorf("开启Publisher Confirm失败: %w", err)
+	}
+
+	p.conn = conn
+	p.channel = ch
+	p.confirms = ch.NotifyPublish(make(chan amqp.Confirmation, 1))
+	p.returns = ch.NotifyReturn(make(chan amqp.Return, 1))
+
+	return nil
+}
+
+func (p *MQPublisher) closeLocked() {
+	if p.channel != nil {
+		_ = p.channel.Close()
+		p.channel = nil
+	}
+	if p.conn != nil {
+		_ = p.conn.Close()
+		p.conn = nil
+	}
+	p.confirms = nil
+	p.returns = nil
+}
+
+func (p *MQPublisher) PublishOrder(ctx context.Context, body []byte) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if err := p.publishLocked(ctx, body); err == nil {
+		return nil
+	} else {
+		log.Printf("MQ发布失败，尝试重连后重试一次: %v", err)
+	}
+
+	if err := p.connectLocked(); err != nil {
+		return err
+	}
+
+	return p.publishLocked(ctx, body)
+}
+
+func (p *MQPublisher) publishLocked(ctx context.Context, body []byte) error {
+	if p.channel == nil {
+		if err := p.connectLocked(); err != nil {
+			return err
+		}
+	}
+
+	if err := p.channel.PublishWithContext(
+		ctx,
+		"",
+		MQ_QUEUE_NAME,
+		true,
+		false,
+		amqp.Publishing{
+			ContentType:  "application/json",
+			DeliveryMode: amqp.Persistent,
+			Timestamp:    time.Now(),
+			Body:         body,
+		},
+	); err != nil {
+		return fmt.Errorf("发布消息失败: %w", err)
+	}
+
+	select {
+	case ret, ok := <-p.returns:
+		if !ok {
+			return fmt.Errorf("RabbitMQ return channel 已关闭")
+		}
+		return fmt.Errorf("消息无法路由: reply_code=%d reply_text=%s exchange=%s routing_key=%s", ret.ReplyCode, ret.ReplyText, ret.Exchange, ret.RoutingKey)
+	case confirm, ok := <-p.confirms:
+		if !ok {
+			return fmt.Errorf("RabbitMQ confirm channel 已关闭")
+		}
+		if !confirm.Ack {
+			return fmt.Errorf("RabbitMQ Nack delivery_tag=%d", confirm.DeliveryTag)
+		}
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("等待RabbitMQ确认超时或取消: %w", ctx.Err())
+	}
+}
 
 type server struct {
 	pb.UnimplementedOrderServiceServer
@@ -99,19 +230,16 @@ func (s *server) CreateOrder(ctx context.Context, req *pb.CreateOrderRequest) (*
 		Amount:    totalAmount,
 	}
 
-	body, _ := json.Marshal(orderMsg)
+	body, err := json.Marshal(orderMsg)
+	if err != nil {
+		return nil, fmt.Errorf("序列化订单消息失败: %w", err)
+	}
 
 	// 发送消息到 RabbitMQ
-	err = mqChannel.PublishWithContext(ctx,
-		"",            //默认交换机
-		MQ_QUEUE_NAME, //队列名
-		false,
-		false,
-		amqp.Publishing{
-			ContentType: "application/json",
-			Body:        body,
-		},
-	)
+	publishCtx, cancelPublish := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelPublish()
+
+	err = mqPublisher.PublishOrder(publishCtx, body)
 
 	//发MQ失败应该回滚Redis库存，这里先打日志
 	if err != nil {
@@ -154,34 +282,12 @@ func initMQ() {
 		log.Fatalf("mq.url 为空，请在 config/order.yaml 设置或通过环境变量 SECKILL_MQ_URL 注入")
 	}
 
-	conn, err := amqp.Dial(mqURL)
-	if err != nil {
-		log.Fatalf("连接RabbitMQ失败: %v", err)
+	mqPublisher = NewMQPublisher(mqURL)
+	if err := mqPublisher.Connect(); err != nil {
+		log.Fatalf("初始化RabbitMQ发布器失败: %v", err)
 	}
 
-	mqChannel, err = conn.Channel()
-	if err != nil {
-		log.Fatalf("创建MQ通道失败: %v", err)
-	}
-
-	args := amqp.Table{
-		"x-dead-letter-exchange":    DeadExchange,   // 报错后发给谁？
-		"x-dead-letter-routing-key": DeadRoutingKey, // 带什么暗号发？
-	}
-
-	_, err = mqChannel.QueueDeclare(
-		MQ_QUEUE_NAME,
-		true, //持久化确保重启后队列还在
-		false,
-		false,
-		false,
-		args,
-	)
-	if err != nil {
-		log.Fatalf("声明队列失败: %v", err)
-	}
-
-	fmt.Println("已连接到 RabbitMQ (MQ Ready)")
+	fmt.Println("已连接到 RabbitMQ (MQ Publisher Ready)")
 }
 
 // 初始化Product Client
