@@ -61,15 +61,16 @@ type OrderMessage struct {
 
 // Order 对应 orders 表。Count/UpdatedAt 用于后续订单状态闭环，旧表缺列时查询会保持零值。
 type Order struct {
-	ID        uint64    `gorm:"column:id;primaryKey;autoIncrement"`
-	OrderID   string    `gorm:"column:order_id;uniqueIndex;not null"`
-	UserID    int64     `gorm:"column:user_id;not null"`
-	ProductID int64     `gorm:"column:product_id;not null"`
-	Count     int32     `gorm:"column:count"`
-	Amount    float32   `gorm:"column:amount;not null"`
-	Status    int32     `gorm:"column:status;default:0"`
-	CreatedAt time.Time `gorm:"column:created_at;autoCreateTime"`
-	UpdatedAt time.Time `gorm:"column:updated_at;autoUpdateTime"`
+	ID         uint64    `gorm:"column:id;primaryKey;autoIncrement"`
+	OrderID    string    `gorm:"column:order_id;uniqueIndex;not null"`
+	UserID     int64     `gorm:"column:user_id;not null"`
+	ProductID  int64     `gorm:"column:product_id;not null"`
+	Count      int32     `gorm:"column:count"`
+	Amount     float32   `gorm:"column:amount;not null"`
+	Status     int32     `gorm:"column:status;default:0"`
+	FailReason string    `gorm:"column:fail_reason"`
+	CreatedAt  time.Time `gorm:"column:created_at;autoCreateTime"`
+	UpdatedAt  time.Time `gorm:"column:updated_at;autoUpdateTime"`
 }
 
 func (Order) TableName() string { return "orders" }
@@ -295,6 +296,68 @@ func orderStatusMessage(status int32) string {
 	}
 }
 
+func createPendingOrder(ctx context.Context, msg OrderMessage) error {
+	order := Order{
+		OrderID:   msg.OrderID,
+		UserID:    msg.UserID,
+		ProductID: msg.ProductID,
+		Count:     msg.Count,
+		Amount:    msg.Amount,
+		Status:    OrderStatusPending,
+	}
+
+	return db.WithContext(ctx).Create(&order).Error
+}
+
+func markOrderFailed(ctx context.Context, orderID string, userID int64, reason string) error {
+	return db.WithContext(ctx).
+		Model(&Order{}).
+		Where("order_id = ? AND user_id = ? AND status = ?", orderID, userID, OrderStatusPending).
+		Updates(map[string]any{
+			"status":      OrderStatusFailed,
+			"fail_reason": reason,
+		}).Error
+}
+
+func rollbackStock(productID, userID int64, count int32) error {
+	rollbackCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	rollbackResp, err := productClient.RollbackStock(rollbackCtx, &pb.DeductStockRequest{
+		ProductId: productID,
+		Count:     count,
+		UserId:    userID,
+	})
+	if err != nil {
+		return err
+	}
+	if !rollbackResp.Success {
+		return errors.New(rollbackResp.Message)
+	}
+
+	return nil
+}
+
+func markPendingOrderFailed(orderID string, userID int64, reason string) {
+	updateCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	if err := markOrderFailed(updateCtx, orderID, userID, reason); err != nil {
+		log.Printf("X! 标记订单失败状态失败，请人工介入: order_id=%s err=%v", orderID, err)
+	}
+}
+
+func rollbackStockAndMarkFailed(orderID string, productID, userID int64, count int32, reason string) {
+	if err := rollbackStock(productID, userID, count); err != nil {
+		log.Printf("X! %s 且回滚库存失败，请人工介入，CRITICAL ERROR: %v", reason, err)
+		markPendingOrderFailed(orderID, userID, reason+"，Redis回滚失败")
+		return
+	}
+
+	log.Printf("库存回滚成功: order_id=%s", orderID)
+	markPendingOrderFailed(orderID, userID, reason)
+}
+
 // CreateOrder 下单逻辑 (异步版)
 func (s *server) CreateOrder(ctx context.Context, req *pb.CreateOrderRequest) (*pb.CreateOrderResponse, error) {
 	fmt.Printf("收到下单请求，用户: %d, 商品: %d\n", req.UserId, req.ProductId)
@@ -327,6 +390,7 @@ func (s *server) CreateOrder(ctx context.Context, req *pb.CreateOrderRequest) (*
 	// 查价格,计算总金额
 	pResp, err := productClient.GetProduct(ctx, &pb.ProductRequest{ProductId: req.ProductId})
 	if err != nil {
+		rollbackStockAndMarkFailed("", req.ProductId, req.UserId, req.Count, "查询商品失败")
 		return nil, err
 	}
 
@@ -341,8 +405,14 @@ func (s *server) CreateOrder(ctx context.Context, req *pb.CreateOrderRequest) (*
 		Amount:    totalAmount,
 	}
 
+	if err := createPendingOrder(ctx, orderMsg); err != nil {
+		rollbackStockAndMarkFailed(orderID, req.ProductId, req.UserId, req.Count, "创建排队订单失败")
+		return nil, fmt.Errorf("创建排队订单失败: %w", err)
+	}
+
 	body, err := json.Marshal(orderMsg)
 	if err != nil {
+		rollbackStockAndMarkFailed(orderID, req.ProductId, req.UserId, req.Count, "序列化订单消息失败")
 		return nil, fmt.Errorf("序列化订单消息失败: %w", err)
 	}
 
@@ -366,24 +436,7 @@ func (s *server) CreateOrder(ctx context.Context, req *pb.CreateOrderRequest) (*
 	}
 
 	if err != nil {
-		//使用新Context避免因超时导致回滚被取消
-		rollbackCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-
-		rollbackResp, errRb := productClient.RollbackStock(rollbackCtx, &pb.DeductStockRequest{
-			ProductId: req.ProductId,
-			Count:     req.Count,
-			UserId:    req.UserId,
-		})
-
-		if errRb != nil {
-			log.Printf("X! MQ发送失败且回滚库存失败，请人工介入，CRITICAL ERROR: %v", errRb)
-		} else if !rollbackResp.Success {
-			log.Printf("X! MQ发送失败且回滚库存失败，请人工介入，CRITICAL ERROR: %s", rollbackResp.Message)
-		} else {
-			log.Printf("库存回滚成功")
-		}
-
+		rollbackStockAndMarkFailed(orderID, req.ProductId, req.UserId, req.Count, "MQ发送失败")
 		return nil, fmt.Errorf("系统繁忙，请稍后重试")
 	}
 
@@ -426,6 +479,11 @@ func (s *server) GetOrder(ctx context.Context, req *pb.GetOrderRequest) (*pb.Get
 		return nil, fmt.Errorf("查询订单失败: %w", err)
 	}
 
+	message := orderStatusMessage(order.Status)
+	if order.Status == OrderStatusFailed && order.FailReason != "" {
+		message = order.FailReason
+	}
+
 	return &pb.GetOrderResponse{
 		Found:      true,
 		OrderId:    order.OrderID,
@@ -435,7 +493,7 @@ func (s *server) GetOrder(ctx context.Context, req *pb.GetOrderRequest) (*pb.Get
 		Amount:     order.Amount,
 		Status:     order.Status,
 		StatusText: orderStatusText(order.Status),
-		Message:    orderStatusMessage(order.Status),
+		Message:    message,
 	}, nil
 }
 

@@ -36,6 +36,12 @@ const (
 	ReconnectDelay = 3 * time.Second
 )
 
+const (
+	OrderStatusPending int32 = 0
+	OrderStatusSuccess int32 = 1
+	OrderStatusFailed  int32 = 2
+)
+
 const ROLLBACK_LUA_SCRIPT = `
 -- KEYS[1]: product:stock:{product_id}
 -- KEYS[2]: product:users:{product_id}
@@ -78,7 +84,10 @@ return 1
 `
 
 type Order struct {
-	OrderID string `gorm:"column:order_id"`
+	OrderID    string `gorm:"column:order_id"`
+	UserID     int64  `gorm:"column:user_id"`
+	Status     int32  `gorm:"column:status"`
+	FailReason string `gorm:"column:fail_reason"`
 }
 
 func (Order) TableName() string { return "orders" }
@@ -183,10 +192,16 @@ func initRedis() {
 	fmt.Println("✅ Redis 连接成功")
 }
 
-func orderExists(ctx context.Context, orderID string) (bool, error) {
-	var count int64
-	err := db.WithContext(ctx).Model(&Order{}).Where("order_id = ?", orderID).Count(&count).Error
-	return count > 0, err
+func getOrder(ctx context.Context, orderID string) (*Order, bool, error) {
+	var order Order
+	err := db.WithContext(ctx).Where("order_id = ?", orderID).First(&order).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return &order, true, nil
 }
 
 func validateMessage(msg OrderMessage) error {
@@ -213,7 +228,32 @@ func rollbackRedis(ctx context.Context, msg OrderMessage) (int, error) {
 	return rdb.Eval(ctx, ROLLBACK_LUA_SCRIPT, []string{stockKey, userSetKey, rollbackKey}, msg.Count, msg.UserID).Int()
 }
 
-func handleRollbackResult(code int, msg OrderMessage, d amqp.Delivery, span trace.Span) {
+func markOrderFailed(ctx context.Context, msg OrderMessage, reason string) error {
+	return db.WithContext(ctx).
+		Model(&Order{}).
+		Where("order_id = ? AND user_id = ? AND status <> ?", msg.OrderID, msg.UserID, OrderStatusSuccess).
+		Updates(map[string]any{
+			"status":      OrderStatusFailed,
+			"fail_reason": reason,
+		}).Error
+}
+
+func markOrderFailedOrRetry(ctx context.Context, msg OrderMessage, reason string, d amqp.Delivery, span trace.Span) bool {
+	if err := markOrderFailed(ctx, msg, reason); err != nil {
+		log.Printf("⚠️ 标记死信订单失败，稍后重试: order_id=%s err=%v", msg.OrderID, err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "mark order failed")
+		dlqConsumeTotal.WithLabelValues("retry").Inc()
+		mqConsumerNackTotal.WithLabelValues(DeadQueue, "true").Inc()
+		time.Sleep(3 * time.Second)
+		d.Nack(false, true)
+		return false
+	}
+
+	return true
+}
+
+func handleRollbackResult(ctx context.Context, code int, msg OrderMessage, d amqp.Delivery, span trace.Span) {
 	switch code {
 	case 0:
 		log.Printf("⚠️ Redis库存Key不存在，稍后重试: order_id=%s product_id=%d", msg.OrderID, msg.ProductID)
@@ -224,6 +264,9 @@ func handleRollbackResult(code int, msg OrderMessage, d amqp.Delivery, span trac
 		time.Sleep(3 * time.Second)
 		d.Nack(false, true)
 	case 1:
+		if !markOrderFailedOrRetry(ctx, msg, "死信补偿成功，订单处理失败", d, span) {
+			return
+		}
 		log.Printf("✅ 死信补偿成功: order_id=%s user_id=%d product_id=%d count=%d", msg.OrderID, msg.UserID, msg.ProductID, msg.Count)
 		span.SetStatus(codes.Ok, "dlq compensation succeeded")
 		dlqConsumeTotal.WithLabelValues("success").Inc()
@@ -231,6 +274,9 @@ func handleRollbackResult(code int, msg OrderMessage, d amqp.Delivery, span trac
 		mqConsumerAckTotal.WithLabelValues(DeadQueue).Inc()
 		d.Ack(false)
 	case 2:
+		if !markOrderFailedOrRetry(ctx, msg, "死信消息数量非法，订单处理失败", d, span) {
+			return
+		}
 		log.Printf("❌ 死信消息数量非法，无法补偿，确认消息: order_id=%s count=%d", msg.OrderID, msg.Count)
 		span.SetStatus(codes.Error, "invalid rollback count")
 		dlqConsumeTotal.WithLabelValues("invalid").Inc()
@@ -238,6 +284,9 @@ func handleRollbackResult(code int, msg OrderMessage, d amqp.Delivery, span trac
 		mqConsumerAckTotal.WithLabelValues(DeadQueue).Inc()
 		d.Ack(false)
 	case 3:
+		if !markOrderFailedOrRetry(ctx, msg, "死信已补偿过，订单处理失败", d, span) {
+			return
+		}
 		log.Printf("✅ 死信已补偿过，直接确认: order_id=%s", msg.OrderID)
 		span.SetStatus(codes.Ok, "already rolled back")
 		dlqConsumeTotal.WithLabelValues("success").Inc()
@@ -245,6 +294,9 @@ func handleRollbackResult(code int, msg OrderMessage, d amqp.Delivery, span trac
 		mqConsumerAckTotal.WithLabelValues(DeadQueue).Inc()
 		d.Ack(false)
 	case 4:
+		if !markOrderFailedOrRetry(ctx, msg, "未找到用户购买记录，订单处理失败", d, span) {
+			return
+		}
 		log.Printf("✅ 未找到用户购买记录，视为无需重复补偿: order_id=%s", msg.OrderID)
 		span.SetStatus(codes.Ok, "no purchase record")
 		dlqConsumeTotal.WithLabelValues("success").Inc()
@@ -252,6 +304,9 @@ func handleRollbackResult(code int, msg OrderMessage, d amqp.Delivery, span trac
 		mqConsumerAckTotal.WithLabelValues(DeadQueue).Inc()
 		d.Ack(false)
 	case 5:
+		if !markOrderFailedOrRetry(ctx, msg, "用户购买记录小于回滚数量，需人工核查", d, span) {
+			return
+		}
 		log.Printf("❌ 用户购买记录小于回滚数量，需人工核查，确认消息: order_id=%s user_id=%d count=%d", msg.OrderID, msg.UserID, msg.Count)
 		span.SetStatus(codes.Error, "manual check required")
 		dlqConsumeTotal.WithLabelValues("manual_check").Inc()
@@ -303,7 +358,7 @@ func handleMessage(d amqp.Delivery) {
 	ctx, cancel := context.WithTimeout(traceCtx, 5*time.Second)
 	defer cancel()
 
-	exists, err := orderExists(ctx, msg.OrderID)
+	order, exists, err := getOrder(ctx, msg.OrderID)
 	if err != nil {
 		log.Printf("⚠️ 查询订单失败，稍后重试: order_id=%s err=%v", msg.OrderID, err)
 		span.RecordError(err)
@@ -314,10 +369,27 @@ func handleMessage(d amqp.Delivery) {
 		d.Nack(false, true)
 		return
 	}
-	if exists {
-		log.Printf("✅ 订单已落库，无需回滚Redis，确认死信: order_id=%s", msg.OrderID)
+
+	if exists && order.Status == OrderStatusSuccess {
+		log.Printf("✅ 订单已成功，无需回滚Redis，确认死信: order_id=%s", msg.OrderID)
 		span.SetStatus(codes.Ok, "order already exists")
 		dlqConsumeTotal.WithLabelValues("order_exists").Inc()
+		mqConsumerAckTotal.WithLabelValues(DeadQueue).Inc()
+		d.Ack(false)
+		return
+	}
+	if exists && order.Status == OrderStatusFailed {
+		log.Printf("✅ 订单已标记失败，无需重复补偿: order_id=%s", msg.OrderID)
+		span.SetStatus(codes.Ok, "order already failed")
+		dlqConsumeTotal.WithLabelValues("already_failed").Inc()
+		mqConsumerAckTotal.WithLabelValues(DeadQueue).Inc()
+		d.Ack(false)
+		return
+	}
+	if exists && order.Status != OrderStatusPending {
+		log.Printf("❌ 未知订单状态，需人工核查，确认死信: order_id=%s status=%d", msg.OrderID, order.Status)
+		span.SetStatus(codes.Error, "unknown order status")
+		dlqConsumeTotal.WithLabelValues("manual_check").Inc()
 		mqConsumerAckTotal.WithLabelValues(DeadQueue).Inc()
 		d.Ack(false)
 		return
@@ -336,7 +408,7 @@ func handleMessage(d amqp.Delivery) {
 		return
 	}
 
-	handleRollbackResult(code, msg, d, span)
+	handleRollbackResult(ctx, code, msg, d, span)
 }
 
 func runConsumer(mqURL string) error {

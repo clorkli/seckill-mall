@@ -6,9 +6,9 @@
 
 - API Gateway：HTTP 入口，负责登录、JWT 鉴权、Sentinel 限流和请求转发。
 - Product Service：商品查询、Redis Lua 原子扣库存、限购记录、库存回滚。
-- Order Service：下单编排，调用商品服务扣库存，生成订单消息并投递 RabbitMQ。
-- MQ Consumer：消费订单消息，使用 MySQL 事务写入订单并同步扣减 `product.stock`。
-- DLQ Consumer：消费死信队列，确认订单未落库后补偿 Redis 库存和用户购买记录。
+- Order Service：下单编排，调用商品服务扣库存，写入排队中订单，生成订单消息并投递 RabbitMQ。
+- MQ Consumer：消费订单消息，使用 MySQL 事务推进订单状态并同步扣减 `product.stock`。
+- DLQ Consumer：消费死信队列，按订单状态补偿 Redis 库存和用户购买记录，并标记失败订单。
 - Common：公共配置、JWT 工具、链路追踪、protobuf 生成代码。
 
 ## 当前状态
@@ -19,15 +19,17 @@
 - 使用 Redis + Lua 原子扣减秒杀库存，避免并发下重复读写导致超卖。
 - 支持用户限购记录，防止同一用户超过配置数量购买。
 - 对非法购买数量做了多层校验，`count <= 0` 会在 Gateway、Order Service、Product Service 被拒绝。
+- 已支持异步订单状态查询，订单会经历 `排队中(status=0)`、`已成功(status=1)`、`已失败(status=2)`。
+- Gateway 提供 `GET /order/:order_id`，用户可查询自己的异步订单处理结果。
 - MQ 投递失败时会调用 `RollbackStock`，同时回滚 Redis 库存和用户购买记录。
 - RabbitMQ 主队列配置死信交换机和死信队列，消费失败消息会进入 DLQ。
-- DLQ Consumer 会消费死信队列，先检查 MySQL 订单是否已存在，未落库才执行 Redis 补偿。
+- DLQ Consumer 会消费死信队列，若订单不是成功状态，则执行 Redis 补偿并将订单标记为失败。
 - Order Service 发布订单消息时已启用 publisher confirm、mandatory 路由检查和消息持久化。
 - Order Service 发送 MQ 失败时会重建 RabbitMQ 连接和 Channel，并自动重试一次。
 - MQ Consumer 和 DLQ Consumer 已支持 RabbitMQ connection/channel 断开后的自动重连和重新消费。
 - 已为 MQ 发布、主队列消费、死信补偿、Ack/Nack、重连和处理耗时增加 Prometheus 业务指标。
 - 已通过 RabbitMQ headers 传播 OpenTelemetry trace context，支持异步 MQ 发布、消费和死信补偿链路在 Jaeger 中关联。
-- MQ Consumer 在 MySQL 事务中写入 `orders` 并扣减 `product.stock`，让 MySQL 成为最终库存账本。
+- MQ Consumer 在 MySQL 事务中推进订单状态并扣减 `product.stock`，让 MySQL 成为最终库存账本。
 - Redis 已开启 AOF，并通过 Docker volume 持久化 `/data`，降低容器重启后的库存丢失风险。
 - 接入 OpenTelemetry + Jaeger 做链路追踪。
 - 接入 Prometheus + Grafana 做基础监控。
@@ -41,15 +43,18 @@ Client
   -> Order Service
   -> gRPC / etcd
   -> Product Service (Redis + Lua)
+  -> Order Service
+  -> MySQL (orders: pending)
   -> RabbitMQ
   -> MQ Consumer
-  -> MySQL (orders + product.stock)
+  -> MySQL (orders: success + product.stock)
 
 失败消息:
 RabbitMQ dead_queue
   -> DLQ Consumer
-  -> MySQL 查询订单是否已落库
+  -> MySQL 查询订单状态
   -> Redis 补偿库存和用户购买记录
+  -> MySQL (orders: failed)
 ```
 
 ## 下单流程
@@ -60,13 +65,13 @@ RabbitMQ dead_queue
 4. Gateway 调用 `OrderService.CreateOrder`。
 5. Order Service 校验购买数量，并调用 `ProductService.DeductStock`。
 6. Product Service 使用 Redis Lua 原子判断库存、限购记录，并扣减 Redis 库存。
-7. Order Service 查询商品价格，生成订单号和 MQ 消息。
+7. Order Service 查询商品价格，生成订单号，并写入 `orders.status = 0` 的排队中订单。
 8. Order Service 将订单消息投递到 RabbitMQ，消息中包含 `order_id`、`user_id`、`product_id`、`count` 和 `amount`。
-9. 如果 MQ 投递失败，Order Service 调用 `RollbackStock`，恢复 Redis 库存和用户购买记录。
+9. 如果 MQ 投递失败，Order Service 调用 `RollbackStock`，恢复 Redis 库存和用户购买记录，并把订单标记为失败。
 10. MQ Consumer 消费订单消息，校验消息格式和 `count`。
-11. MQ Consumer 开启 MySQL 事务，写入 `orders` 并扣减 `product.stock`。
+11. MQ Consumer 开启 MySQL 事务，锁定排队中订单，扣减 `product.stock`，并把订单标记为成功。
 12. 事务成功则 Ack；失败则 Nack 且不重回队列，消息进入死信队列。
-13. DLQ Consumer 消费死信消息，若 MySQL 中不存在该订单，则补偿 Redis 库存和用户购买记录。
+13. DLQ Consumer 消费死信消息，若订单不是成功状态，则补偿 Redis 库存和用户购买记录，并把订单标记为失败。
 
 ## 库存一致性设计
 
@@ -79,9 +84,10 @@ RabbitMQ dead_queue
 
 ```text
 Redis 扣减成功
+-> Order Service 写入 Pending 订单
 -> MQ 投递成功
--> Consumer 事务写订单
 -> Consumer 事务扣 MySQL product.stock
+-> Consumer 事务更新订单为 Success
 -> Ack
 ```
 
@@ -89,18 +95,21 @@ Redis 扣减成功
 
 ```text
 Redis 已扣减
+-> Pending 订单已写入
 -> MQ 投递失败
 -> RollbackStock
 -> Redis 库存恢复
 -> Redis 用户购买记录恢复
+-> 订单更新为 Failed
 ```
 
 如果 Consumer 落库失败：
 
 ```text
 消息进入死信队列
--> DLQ Consumer 查询 MySQL 是否已有订单
--> 订单不存在则补偿 Redis 库存和用户购买记录
+-> DLQ Consumer 查询 MySQL 订单状态
+-> 订单不是 Success 则补偿 Redis 库存和用户购买记录
+-> Pending 订单更新为 Failed
 -> 补偿成功后 Ack 死信消息
 ```
 
@@ -179,14 +188,28 @@ CREATE TABLE IF NOT EXISTS orders (
 	order_id VARCHAR(64) NOT NULL,
 	user_id BIGINT NOT NULL,
 	product_id BIGINT NOT NULL,
+	count INT NOT NULL DEFAULT 1,
 	amount DECIMAL(10,2) NOT NULL,
 	status INT NOT NULL DEFAULT 0,
+	fail_reason VARCHAR(255) DEFAULT '',
 	created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-	UNIQUE KEY uk_order_id (order_id)
+	updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+	UNIQUE KEY uk_order_id (order_id),
+	KEY idx_user_id (user_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 INSERT INTO product (name, price, stock, description)
 VALUES ('iPhone 15', 6999.00, 100, '秒杀测试商品');
+```
+
+如果你已有旧版 `orders` 表，需要先补充订单状态查询所需字段：
+
+```sql
+ALTER TABLE orders
+ADD COLUMN count INT NOT NULL DEFAULT 1 AFTER product_id,
+ADD COLUMN fail_reason VARCHAR(255) DEFAULT '' AFTER status,
+ADD COLUMN updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP AFTER created_at,
+ADD INDEX idx_user_id (user_id);
 ```
 
 ## 联调验证
@@ -208,10 +231,23 @@ curl -X POST http://127.0.0.1:8080/order \
   -d '{"product_id": 1, "count": 1}'
 ```
 
-### 3. 查询订单和库存
+### 3. 通过 HTTP 查询订单状态
+
+```bash
+curl http://127.0.0.1:8080/order/<order_id> \
+  -H "Authorization: Bearer <your-token>"
+```
+
+订单状态含义：
+
+- `status = 0`：排队中，订单已受理，等待 MQ Consumer 最终处理。
+- `status = 1`：已成功，订单已落库并同步扣减 MySQL `product.stock`。
+- `status = 2`：已失败，Redis 库存和用户购买记录已尝试补偿。
+
+### 4. 查询订单和库存
 
 ```sql
-SELECT id, order_id, user_id, product_id, amount, status, created_at
+SELECT id, order_id, user_id, product_id, count, amount, status, fail_reason, created_at, updated_at
 FROM orders
 ORDER BY id DESC
 LIMIT 20;
@@ -221,7 +257,7 @@ FROM product
 WHERE id = 1;
 ```
 
-如果订单成功消费，`orders` 会新增记录，`product.stock` 会同步减少。
+如果订单成功消费，`orders.status` 会从 `0` 更新为 `1`，`product.stock` 会同步减少。
 
 ## 配置说明
 
@@ -260,6 +296,7 @@ MQ 异步链路会通过 RabbitMQ headers 传递 OpenTelemetry trace context。O
 
 - `mq_consumer` 对旧格式 MQ 消息不兼容。旧消息没有 `count` 字段，会被识别为非法消息并进入死信队列。
 - `dlq_consumer` 对旧格式或字段缺失的死信消息无法自动补偿，会记录日志并确认消息，避免毒丸消息阻塞队列。
+- Order Service 会写入排队中订单，已有旧表需要先执行 `orders` 表字段升级 SQL，否则会因为缺少 `count`、`fail_reason` 或 `updated_at` 导致写入失败。
 - Product Service 在 `debug` 模式下会启用 `/dev/reset`，该接口会清空 Redis 和 `orders` 表，但当前不会自动恢复 `product.stock` 到初始值。
 - DLQ Consumer 已支持常见落库失败后的 Redis 补偿，但对用户购买记录小于回滚数量等异常状态仍需要人工核查日志。
 - RabbitMQ 生产者侧已启用 publisher confirm、persistent message、mandatory return 和失败重连重试；Consumer 侧已支持连接断开后自动重连。
@@ -273,11 +310,10 @@ MQ 异步链路会通过 RabbitMQ headers 传递 OpenTelemetry trace context。O
 1. 增加 Grafana dashboard 和 Prometheus alert：展示 MQ publish、consume、DLQ 补偿、重连、队列积压，并配置失败率和积压告警。
 2. 引入 Outbox 模式：进一步降低“Redis 已扣减但 MQ 确认状态不明”这类分布式边界风险。
 3. 修复开发重置能力：让 `/dev/reset` 同步恢复 `product.stock` 到测试初始库存，或改成显式传入重置库存。
-4. 抽离订单状态：引入订单状态机，例如排队中、已创建、失败、已取消，避免只依赖 MQ 成功与否判断订单结果。
-5. 增加查询接口：增加订单查询接口，用户下单后可以查询异步处理结果。
-6. 改善服务注册：etcd 注册地址改为可配置，支持 Docker、WSL、多机部署场景。
-7. 增加自动化测试：补充 Redis Lua、库存回滚、Consumer 幂等、MySQL 事务扣库存、DLQ 补偿、MQ 发布确认、消费端重连和 MQ trace propagation 等核心测试。
-8. 增加数据库迁移并完善安全边界：引入 migration 工具，关闭生产环境 `/dev/reset`，JWT secret 强度校验，敏感日志脱敏。
+4. 扩展订单状态机：增加已取消、超时关闭、人工核查等状态，并记录状态流转历史。
+5. 改善服务注册：etcd 注册地址改为可配置，支持 Docker、WSL、多机部署场景。
+6. 增加自动化测试：补充 Redis Lua、库存回滚、Consumer 幂等、MySQL 事务扣库存、DLQ 补偿、MQ 发布确认、消费端重连和 MQ trace propagation 等核心测试。
+7. 增加数据库迁移并完善安全边界：引入 migration 工具，关闭生产环境 `/dev/reset`，JWT secret 强度校验，敏感日志脱敏。
 
 ## 技术栈
 

@@ -8,7 +8,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -17,6 +16,7 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"seckill-mall/common/config"
 	"seckill-mall/common/tracer"
@@ -33,6 +33,12 @@ const (
 	DeadRoutingKey = "dead_key"     // 死信路由键
 
 	ReconnectDelay = 3 * time.Second
+)
+
+const (
+	OrderStatusPending int32 = 0
+	OrderStatusSuccess int32 = 1
+	OrderStatusFailed  int32 = 2
 )
 
 // 初始化队列系统
@@ -79,16 +85,16 @@ func setupQueue(ch *amqp.Channel) (amqp.Queue, error) {
 
 // 对应数据库结构
 type Order struct {
-	// 对应数据库 id, bigint(20) unsigned, auto_increment
-	ID uint64 `gorm:"column:id;primaryKey;autoIncrement"`
-	// 对应数据库 order_id, varchar(64)
-	OrderID string `gorm:"column:order_id;uniqueIndex;not null"`
-	// 其他字段
-	UserID    int64     `gorm:"column:user_id;not null"`
-	ProductID int64     `gorm:"column:product_id;not null"`
-	Amount    float32   `gorm:"column:amount;not null"`
-	Status    int       `gorm:"column:status;default:0"`
-	CreatedAt time.Time `gorm:"column:created_at;autoCreateTime"`
+	ID         uint64    `gorm:"column:id;primaryKey;autoIncrement"`
+	OrderID    string    `gorm:"column:order_id;uniqueIndex;not null"`
+	UserID     int64     `gorm:"column:user_id;not null"`
+	ProductID  int64     `gorm:"column:product_id;not null"`
+	Count      int32     `gorm:"column:count"`
+	Amount     float32   `gorm:"column:amount;not null"`
+	Status     int32     `gorm:"column:status;default:0"`
+	FailReason string    `gorm:"column:fail_reason"`
+	CreatedAt  time.Time `gorm:"column:created_at;autoCreateTime"`
+	UpdatedAt  time.Time `gorm:"column:updated_at;autoUpdateTime"`
 }
 
 func (Order) TableName() string { return "orders" }
@@ -105,6 +111,7 @@ type OrderMessage struct {
 var db *gorm.DB
 
 var errMySQLStockNotEnough = errors.New("mysql stock not enough")
+var errOrderAlreadyFinished = errors.New("order already finished")
 
 var (
 	mqConsumeTotal = promauto.NewCounterVec(
@@ -145,39 +152,90 @@ var (
 	)
 )
 
-func isDuplicateOrderError(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "Duplicate entry")
-}
-
 func persistOrder(ctx context.Context, msg OrderMessage) error {
-	order := Order{
-		OrderID:   msg.OrderID,
-		UserID:    msg.UserID,
-		ProductID: msg.ProductID,
-		Amount:    msg.Amount,
-		Status:    1, // 已支付/处理中
-	}
-
 	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := tx.Create(&order).Error; err != nil {
+		var order Order
+		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("order_id = ?", msg.OrderID).
+			First(&order).Error
+
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return persistLegacyOrder(tx, msg)
+		}
+		if err != nil {
 			return err
 		}
 
-		result := tx.Exec(
-			"UPDATE product SET stock = stock - ? WHERE id = ? AND stock >= ?",
-			msg.Count,
-			msg.ProductID,
-			msg.Count,
-		)
+		if order.Status == OrderStatusSuccess || order.Status == OrderStatusFailed {
+			return errOrderAlreadyFinished
+		}
+		if order.Status != OrderStatusPending {
+			return fmt.Errorf("未知订单状态: order_id=%s status=%d", msg.OrderID, order.Status)
+		}
+
+		if err := decrementMySQLStock(tx, msg); err != nil {
+			return err
+		}
+
+		result := tx.Model(&Order{}).
+			Where("order_id = ? AND status = ?", msg.OrderID, OrderStatusPending).
+			Updates(map[string]any{
+				"product_id":  msg.ProductID,
+				"count":       msg.Count,
+				"amount":      msg.Amount,
+				"status":      OrderStatusSuccess,
+				"fail_reason": "",
+			})
 		if result.Error != nil {
 			return result.Error
 		}
 		if result.RowsAffected == 0 {
-			return errMySQLStockNotEnough
+			return errOrderAlreadyFinished
 		}
 
 		return nil
 	})
+}
+
+func decrementMySQLStock(tx *gorm.DB, msg OrderMessage) error {
+	result := tx.Exec(
+		"UPDATE product SET stock = stock - ? WHERE id = ? AND stock >= ?",
+		msg.Count,
+		msg.ProductID,
+		msg.Count,
+	)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return errMySQLStockNotEnough
+	}
+
+	return nil
+}
+
+func persistLegacyOrder(tx *gorm.DB, msg OrderMessage) error {
+	if err := decrementMySQLStock(tx, msg); err != nil {
+		return err
+	}
+
+	order := Order{
+		OrderID:   msg.OrderID,
+		UserID:    msg.UserID,
+		ProductID: msg.ProductID,
+		Count:     msg.Count,
+		Amount:    msg.Amount,
+		Status:    OrderStatusSuccess,
+	}
+
+	if err := tx.Create(&order).Error; err != nil {
+		if errors.Is(err, gorm.ErrDuplicatedKey) {
+			return errOrderAlreadyFinished
+		}
+		return err
+	}
+
+	return nil
 }
 
 func runConsumer(mqURL string) error {
@@ -282,11 +340,10 @@ func handleMessage(d amqp.Delivery) {
 	// 写入订单并同步扣减 MySQL 商品库存，保证最终库存账本一致。
 	err := persistOrder(traceCtx, msg)
 	if err != nil {
-		// 场景 A: 重复消费 (幂等性保护)
-		if isDuplicateOrderError(err) {
-			fmt.Printf(" -> ⚠️ 订单已存在，确认消息\n")
-			span.SetStatus(codes.Ok, "duplicate order acknowledged")
-			// 事务已回滚，避免重复扣减 product.stock。
+		// 场景 A: 重复消费或已失败订单，幂等确认，避免重复扣减 product.stock。
+		if errors.Is(err, errOrderAlreadyFinished) {
+			fmt.Printf(" -> ⚠️ 订单已结束，确认消息\n")
+			span.SetStatus(codes.Ok, "finished order acknowledged")
 			mqConsumeTotal.WithLabelValues(OrderQueue, "duplicate").Inc()
 			mqConsumerAckTotal.WithLabelValues(OrderQueue).Inc()
 			d.Ack(false)
