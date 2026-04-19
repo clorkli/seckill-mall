@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math/rand"
@@ -17,6 +18,8 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"gorm.io/driver/mysql"
+	"gorm.io/gorm"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/client/v3/naming/endpoints"
@@ -41,7 +44,13 @@ const (
 	DeadRoutingKey       = "dead_key"
 )
 
-// 数据库模型
+const (
+	OrderStatusPending int32 = 0
+	OrderStatusSuccess int32 = 1
+	OrderStatusFailed  int32 = 2
+)
+
+// OrderMessage 是投递给 RabbitMQ 的订单消息。
 type OrderMessage struct {
 	OrderID   string  `json:"order_id"`
 	UserID    int64   `json:"user_id"`
@@ -50,8 +59,24 @@ type OrderMessage struct {
 	Amount    float32 `json:"amount"`
 }
 
+// Order 对应 orders 表。Count/UpdatedAt 用于后续订单状态闭环，旧表缺列时查询会保持零值。
+type Order struct {
+	ID        uint64    `gorm:"column:id;primaryKey;autoIncrement"`
+	OrderID   string    `gorm:"column:order_id;uniqueIndex;not null"`
+	UserID    int64     `gorm:"column:user_id;not null"`
+	ProductID int64     `gorm:"column:product_id;not null"`
+	Count     int32     `gorm:"column:count"`
+	Amount    float32   `gorm:"column:amount;not null"`
+	Status    int32     `gorm:"column:status;default:0"`
+	CreatedAt time.Time `gorm:"column:created_at;autoCreateTime"`
+	UpdatedAt time.Time `gorm:"column:updated_at;autoUpdateTime"`
+}
+
+func (Order) TableName() string { return "orders" }
+
 var productClient pb.ProductServiceClient
 var mqPublisher *MQPublisher
+var db *gorm.DB
 
 var (
 	mqPublishTotal = promauto.NewCounterVec(
@@ -244,6 +269,32 @@ type server struct {
 	pb.UnimplementedOrderServiceServer
 }
 
+func orderStatusText(status int32) string {
+	switch status {
+	case OrderStatusPending:
+		return "排队中"
+	case OrderStatusSuccess:
+		return "已成功"
+	case OrderStatusFailed:
+		return "已失败"
+	default:
+		return "未知状态"
+	}
+}
+
+func orderStatusMessage(status int32) string {
+	switch status {
+	case OrderStatusPending:
+		return "订单排队处理中，请稍后查询"
+	case OrderStatusSuccess:
+		return "订单已成功创建"
+	case OrderStatusFailed:
+		return "订单处理失败"
+	default:
+		return "订单状态未知，请联系管理员核查"
+	}
+}
+
 // CreateOrder 下单逻辑 (异步版)
 func (s *server) CreateOrder(ctx context.Context, req *pb.CreateOrderRequest) (*pb.CreateOrderResponse, error) {
 	fmt.Printf("收到下单请求，用户: %d, 商品: %d\n", req.UserId, req.ProductId)
@@ -345,6 +396,65 @@ func (s *server) CreateOrder(ctx context.Context, req *pb.CreateOrderRequest) (*
 	}, nil
 }
 
+// GetOrder 查询当前用户自己的订单状态。
+func (s *server) GetOrder(ctx context.Context, req *pb.GetOrderRequest) (*pb.GetOrderResponse, error) {
+	if req.OrderId == "" {
+		return &pb.GetOrderResponse{
+			Found:   false,
+			Message: "订单号不能为空",
+		}, nil
+	}
+	if req.UserId <= 0 {
+		return &pb.GetOrderResponse{
+			Found:   false,
+			Message: "用户ID非法",
+		}, nil
+	}
+
+	var order Order
+	err := db.WithContext(ctx).
+		Where("order_id = ? AND user_id = ?", req.OrderId, req.UserId).
+		First(&order).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return &pb.GetOrderResponse{
+			Found:   false,
+			OrderId: req.OrderId,
+			Message: "订单不存在",
+		}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("查询订单失败: %w", err)
+	}
+
+	return &pb.GetOrderResponse{
+		Found:      true,
+		OrderId:    order.OrderID,
+		UserId:     order.UserID,
+		ProductId:  order.ProductID,
+		Count:      order.Count,
+		Amount:     order.Amount,
+		Status:     order.Status,
+		StatusText: orderStatusText(order.Status),
+		Message:    orderStatusMessage(order.Status),
+	}, nil
+}
+
+// 初始化MySQL连接
+func initDB() {
+	dsn := config.Conf.MySQL.DSN
+	if dsn == "" {
+		log.Fatalf("mysql.dsn 为空，请在 config/order.yaml 设置或通过环境变量 SECKILL_MYSQL_DSN 注入")
+	}
+
+	var err error
+	db, err = gorm.Open(mysql.Open(dsn), &gorm.Config{})
+	if err != nil {
+		log.Fatalf("连接MySQL失败: %v", err)
+	}
+
+	fmt.Println("已连接到 MySQL (Order Query Ready)")
+}
+
 // 初始化RabbitMQ连接
 func initMQ() {
 	mqURL := config.Conf.MQ.URL
@@ -428,6 +538,7 @@ func main() {
 	//最好使用宿主机真实IP地址，避免容器重启后地址变化导致注册失败
 	myAddr := "127.0.0.1:" + port
 
+	initDB()
 	initMQ()
 	initProductClient()
 	registerEtcd(myAddr)
