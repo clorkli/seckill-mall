@@ -50,6 +50,15 @@ const (
 	OrderStatusFailed  int32 = 2
 )
 
+const (
+	OutboxStatusPending int32 = 0
+	OutboxStatusSent    int32 = 1
+	OutboxStatusFailed  int32 = 2
+
+	OutboxAggregateOrder    = "order"
+	OutboxEventOrderCreated = "order.created"
+)
+
 // OrderMessage 是投递给 RabbitMQ 的订单消息。
 type OrderMessage struct {
 	OrderID   string  `json:"order_id"`
@@ -74,6 +83,24 @@ type Order struct {
 }
 
 func (Order) TableName() string { return "orders" }
+
+// OutboxEvent 记录需要可靠投递到 MQ 的领域事件，后续由 outbox_worker 扫描发送。
+type OutboxEvent struct {
+	ID            uint64    `gorm:"column:id;primaryKey;autoIncrement"`
+	EventID       string    `gorm:"column:event_id;uniqueIndex;not null"`
+	AggregateType string    `gorm:"column:aggregate_type;not null"`
+	AggregateID   string    `gorm:"column:aggregate_id;not null"`
+	EventType     string    `gorm:"column:event_type;not null"`
+	Payload       string    `gorm:"column:payload;type:json;not null"`
+	Status        int32     `gorm:"column:status;default:0"`
+	RetryCount    int       `gorm:"column:retry_count;default:0"`
+	NextRetryAt   time.Time `gorm:"column:next_retry_at;not null"`
+	LastError     string    `gorm:"column:last_error"`
+	CreatedAt     time.Time `gorm:"column:created_at;autoCreateTime"`
+	UpdatedAt     time.Time `gorm:"column:updated_at;autoUpdateTime"`
+}
+
+func (OutboxEvent) TableName() string { return "outbox_events" }
 
 var productClient pb.ProductServiceClient
 var mqPublisher *MQPublisher
@@ -296,7 +323,19 @@ func orderStatusMessage(status int32) string {
 	}
 }
 
-func createPendingOrder(ctx context.Context, msg OrderMessage) error {
+func orderCreatedEventID(orderID string) string {
+	return "order.created:" + orderID
+}
+
+func truncateText(s string, maxLen int) string {
+	runes := []rune(s)
+	if len(runes) <= maxLen {
+		return s
+	}
+	return string(runes[:maxLen])
+}
+
+func createPendingOrderWithOutbox(ctx context.Context, msg OrderMessage, payload []byte) error {
 	order := Order{
 		OrderID:   msg.OrderID,
 		UserID:    msg.UserID,
@@ -305,8 +344,46 @@ func createPendingOrder(ctx context.Context, msg OrderMessage) error {
 		Amount:    msg.Amount,
 		Status:    OrderStatusPending,
 	}
+	event := OutboxEvent{
+		EventID:       orderCreatedEventID(msg.OrderID),
+		AggregateType: OutboxAggregateOrder,
+		AggregateID:   msg.OrderID,
+		EventType:     OutboxEventOrderCreated,
+		Payload:       string(payload),
+		Status:        OutboxStatusPending,
+		NextRetryAt:   time.Now(),
+	}
 
-	return db.WithContext(ctx).Create(&order).Error
+	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&order).Error; err != nil {
+			return err
+		}
+		if err := tx.Create(&event).Error; err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
+func markOutboxSent(ctx context.Context, orderID string) error {
+	return db.WithContext(ctx).
+		Model(&OutboxEvent{}).
+		Where("event_id = ? AND status = ?", orderCreatedEventID(orderID), OutboxStatusPending).
+		Updates(map[string]any{
+			"status":     OutboxStatusSent,
+			"last_error": "",
+		}).Error
+}
+
+func markOutboxFailed(ctx context.Context, orderID string, err error) error {
+	return db.WithContext(ctx).
+		Model(&OutboxEvent{}).
+		Where("event_id = ? AND status = ?", orderCreatedEventID(orderID), OutboxStatusPending).
+		Updates(map[string]any{
+			"status":     OutboxStatusFailed,
+			"last_error": truncateText(err.Error(), 255),
+		}).Error
 }
 
 func markOrderFailed(ctx context.Context, orderID string, userID int64, reason string) error {
@@ -315,7 +392,7 @@ func markOrderFailed(ctx context.Context, orderID string, userID int64, reason s
 		Where("order_id = ? AND user_id = ? AND status = ?", orderID, userID, OrderStatusPending).
 		Updates(map[string]any{
 			"status":      OrderStatusFailed,
-			"fail_reason": reason,
+			"fail_reason": truncateText(reason, 255),
 		}).Error
 }
 
@@ -344,6 +421,15 @@ func markPendingOrderFailed(orderID string, userID int64, reason string) {
 
 	if err := markOrderFailed(updateCtx, orderID, userID, reason); err != nil {
 		log.Printf("X! 标记订单失败状态失败，请人工介入: order_id=%s err=%v", orderID, err)
+	}
+}
+
+func markOutboxEventFailed(orderID string, err error) {
+	updateCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	if errUpdate := markOutboxFailed(updateCtx, orderID, err); errUpdate != nil {
+		log.Printf("X! 标记Outbox事件失败状态失败，请人工介入: order_id=%s err=%v", orderID, errUpdate)
 	}
 }
 
@@ -405,15 +491,15 @@ func (s *server) CreateOrder(ctx context.Context, req *pb.CreateOrderRequest) (*
 		Amount:    totalAmount,
 	}
 
-	if err := createPendingOrder(ctx, orderMsg); err != nil {
-		rollbackStockAndMarkFailed(orderID, req.ProductId, req.UserId, req.Count, "创建排队订单失败")
-		return nil, fmt.Errorf("创建排队订单失败: %w", err)
-	}
-
 	body, err := json.Marshal(orderMsg)
 	if err != nil {
 		rollbackStockAndMarkFailed(orderID, req.ProductId, req.UserId, req.Count, "序列化订单消息失败")
 		return nil, fmt.Errorf("序列化订单消息失败: %w", err)
+	}
+
+	if err := createPendingOrderWithOutbox(ctx, orderMsg, body); err != nil {
+		rollbackStockAndMarkFailed(orderID, req.ProductId, req.UserId, req.Count, "创建排队订单和Outbox事件失败")
+		return nil, fmt.Errorf("创建排队订单和Outbox事件失败: %w", err)
 	}
 
 	// 发送消息到 RabbitMQ
@@ -437,7 +523,14 @@ func (s *server) CreateOrder(ctx context.Context, req *pb.CreateOrderRequest) (*
 
 	if err != nil {
 		rollbackStockAndMarkFailed(orderID, req.ProductId, req.UserId, req.Count, "MQ发送失败")
+		markOutboxEventFailed(orderID, err)
 		return nil, fmt.Errorf("系统繁忙，请稍后重试")
+	}
+
+	updateOutboxCtx, cancelUpdateOutbox := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancelUpdateOutbox()
+	if err := markOutboxSent(updateOutboxCtx, orderID); err != nil {
+		log.Printf("标记Outbox事件已发送失败，后续Worker可能重复投递: order_id=%s err=%v", orderID, err)
 	}
 
 	fmt.Printf("下单请求已发送到MQ，订单ID: %s\n", orderID)

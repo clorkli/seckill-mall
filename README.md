@@ -21,6 +21,7 @@
 - 对非法购买数量做了多层校验，`count <= 0` 会在 Gateway、Order Service、Product Service 被拒绝。
 - 已支持异步订单状态查询，订单会经历 `排队中(status=0)`、`已成功(status=1)`、`已失败(status=2)`。
 - Gateway 提供 `GET /order/:order_id`，用户可查询自己的异步订单处理结果。
+- Order Service 会在同一个 MySQL 事务中写入排队中订单和 `outbox_events` 待投递事件，为 Outbox Worker 接管 MQ 投递做准备。
 - MQ 投递失败时会调用 `RollbackStock`，同时回滚 Redis 库存和用户购买记录。
 - RabbitMQ 主队列配置死信交换机和死信队列，消费失败消息会进入 DLQ。
 - DLQ Consumer 会消费死信队列，若订单不是成功状态，则执行 Redis 补偿并将订单标记为失败。
@@ -84,8 +85,9 @@ RabbitMQ dead_queue
 
 ```text
 Redis 扣减成功
--> Order Service 写入 Pending 订单
+-> Order Service 同事务写入 Pending 订单和 Outbox Pending 事件
 -> MQ 投递成功
+-> Outbox 事件更新为 Sent
 -> Consumer 事务扣 MySQL product.stock
 -> Consumer 事务更新订单为 Success
 -> Ack
@@ -95,13 +97,16 @@ Redis 扣减成功
 
 ```text
 Redis 已扣减
--> Pending 订单已写入
+-> Pending 订单和 Outbox Pending 事件已写入
 -> MQ 投递失败
 -> RollbackStock
 -> Redis 库存恢复
 -> Redis 用户购买记录恢复
 -> 订单更新为 Failed
+-> Outbox 事件更新为 Failed
 ```
+
+当前 Outbox 处于过渡阶段：Order Service 已经写入 `outbox_events` 并维护同步 MQ 发布结果，但 MQ 投递仍由请求链路同步完成。后续引入独立 `outbox_worker` 后，可以改为由 Worker 扫描 `status = 0` 的事件并可靠投递 MQ。
 
 如果 Consumer 落库失败：
 
@@ -198,6 +203,24 @@ CREATE TABLE IF NOT EXISTS orders (
 	KEY idx_user_id (user_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+CREATE TABLE IF NOT EXISTS outbox_events (
+	id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+	event_id VARCHAR(64) NOT NULL,
+	aggregate_type VARCHAR(32) NOT NULL,
+	aggregate_id VARCHAR(64) NOT NULL,
+	event_type VARCHAR(64) NOT NULL,
+	payload JSON NOT NULL,
+	status INT NOT NULL DEFAULT 0,
+	retry_count INT NOT NULL DEFAULT 0,
+	next_retry_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	last_error VARCHAR(255) DEFAULT '',
+	created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+	UNIQUE KEY uk_event_id (event_id),
+	KEY idx_status_next_retry (status, next_retry_at),
+	KEY idx_aggregate_id (aggregate_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 INSERT INTO product (name, price, stock, description)
 VALUES ('iPhone 15', 6999.00, 100, '秒杀测试商品');
 ```
@@ -210,6 +233,28 @@ ADD COLUMN count INT NOT NULL DEFAULT 1 AFTER product_id,
 ADD COLUMN fail_reason VARCHAR(255) DEFAULT '' AFTER status,
 ADD COLUMN updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP AFTER created_at,
 ADD INDEX idx_user_id (user_id);
+```
+
+同时需要新增 Outbox 事件表：
+
+```sql
+CREATE TABLE IF NOT EXISTS outbox_events (
+	id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+	event_id VARCHAR(64) NOT NULL,
+	aggregate_type VARCHAR(32) NOT NULL,
+	aggregate_id VARCHAR(64) NOT NULL,
+	event_type VARCHAR(64) NOT NULL,
+	payload JSON NOT NULL,
+	status INT NOT NULL DEFAULT 0,
+	retry_count INT NOT NULL DEFAULT 0,
+	next_retry_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	last_error VARCHAR(255) DEFAULT '',
+	created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+	UNIQUE KEY uk_event_id (event_id),
+	KEY idx_status_next_retry (status, next_retry_at),
+	KEY idx_aggregate_id (aggregate_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 ```
 
 ## 联调验证
@@ -297,6 +342,7 @@ MQ 异步链路会通过 RabbitMQ headers 传递 OpenTelemetry trace context。O
 - `mq_consumer` 对旧格式 MQ 消息不兼容。旧消息没有 `count` 字段，会被识别为非法消息并进入死信队列。
 - `dlq_consumer` 对旧格式或字段缺失的死信消息无法自动补偿，会记录日志并确认消息，避免毒丸消息阻塞队列。
 - Order Service 会写入排队中订单，已有旧表需要先执行 `orders` 表字段升级 SQL，否则会因为缺少 `count`、`fail_reason` 或 `updated_at` 导致写入失败。
+- 当前 Outbox 只完成表结构和事件写入，尚未接入独立 Worker；同步 MQ 投递仍然保留，避免切换过猛。
 - Product Service 在 `debug` 模式下会启用 `/dev/reset`，该接口会清空 Redis 和 `orders` 表，但当前不会自动恢复 `product.stock` 到初始值。
 - DLQ Consumer 已支持常见落库失败后的 Redis 补偿，但对用户购买记录小于回滚数量等异常状态仍需要人工核查日志。
 - RabbitMQ 生产者侧已启用 publisher confirm、persistent message、mandatory return 和失败重连重试；Consumer 侧已支持连接断开后自动重连。
@@ -308,7 +354,7 @@ MQ 异步链路会通过 RabbitMQ headers 传递 OpenTelemetry trace context。O
 建议按优先级继续推进：
 
 1. 增加 Grafana dashboard 和 Prometheus alert：展示 MQ publish、consume、DLQ 补偿、重连、队列积压，并配置失败率和积压告警。
-2. 引入 Outbox 模式：进一步降低“Redis 已扣减但 MQ 确认状态不明”这类分布式边界风险。
+2. 完成 Outbox Worker：扫描 `outbox_events.status = 0` 的事件，发布 MQ，处理重试、失败补偿和状态更新。
 3. 修复开发重置能力：让 `/dev/reset` 同步恢复 `product.stock` 到测试初始库存，或改成显式传入重置库存。
 4. 扩展订单状态机：增加已取消、超时关闭、人工核查等状态，并记录状态流转历史。
 5. 改善服务注册：etcd 注册地址改为可配置，支持 Docker、WSL、多机部署场景。
