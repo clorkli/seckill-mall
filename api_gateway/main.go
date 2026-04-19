@@ -166,6 +166,43 @@ func main() {
 		c.JSON(200, gin.H{"data": resp})
 	})
 
+	// 接口: 查询订单
+	r.GET("/order/:order_id", middleware.JWTAuth(), func(c *gin.Context) {
+		userID, exists := c.Get("userID")
+		if !exists {
+			c.JSON(401, gin.H{"error": "未鉴权用户"})
+			return
+		}
+
+		orderID := c.Param("order_id")
+		if orderID == "" {
+			c.JSON(400, gin.H{"error": "订单号不能为空"})
+			return
+		}
+
+		resp, err := orderClient.GetOrder(c.Request.Context(), &pb.GetOrderRequest{
+			OrderId: orderID,
+			UserId:  userID.(int64),
+		})
+		if err != nil {
+			c.JSON(500, gin.H{"error": err.Error()})
+			return
+		}
+		if !resp.Found {
+			c.JSON(404, gin.H{
+				"code":    404,
+				"message": resp.Message,
+			})
+			return
+		}
+
+		c.JSON(200, gin.H{
+			"code":    200,
+			"message": "查询成功",
+			"data":    resp,
+		})
+	})
+
 	// 接口: 下单
 	r.POST("/order", middleware.SentinelLimit("create_order"), middleware.JWTAuth(), func(c *gin.Context) {
 
@@ -202,7 +239,7 @@ func main() {
 
 		c.JSON(200, gin.H{
 			"code":    200,
-			"message": "下单成功",
+			"message": "请求已受理",
 			"data":    resp,
 		})
 	})
