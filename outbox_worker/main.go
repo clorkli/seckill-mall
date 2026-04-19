@@ -6,9 +6,15 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
+	"net/http"
+	"os"
 	"strconv"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/redis/go-redis/v9"
 	"gorm.io/driver/mysql"
@@ -136,6 +142,71 @@ type MQPublisher struct {
 var db *gorm.DB
 var rdb *redis.Client
 
+var (
+	outboxPendingGauge = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "seckill_outbox_pending_events",
+			Help: "Current number of pending outbox events.",
+		},
+	)
+	outboxScanTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "seckill_outbox_scan_total",
+			Help: "Total number of outbox scan attempts by result.",
+		},
+		[]string{"result"},
+	)
+	outboxClaimedTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "seckill_outbox_claimed_total",
+			Help: "Total number of outbox events claimed for processing.",
+		},
+	)
+	outboxProcessDuration = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "seckill_outbox_process_duration_seconds",
+			Help:    "Outbox event processing duration in seconds by result.",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"result"},
+	)
+	outboxPublishTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "seckill_outbox_publish_total",
+			Help: "Total number of outbox RabbitMQ publish attempts by result.",
+		},
+		[]string{"result"},
+	)
+	outboxPublishDuration = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "seckill_outbox_publish_duration_seconds",
+			Help:    "Outbox RabbitMQ publish duration in seconds by result.",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"result"},
+	)
+	outboxRetryTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "seckill_outbox_retry_total",
+			Help: "Total number of outbox retries scheduled by reason.",
+		},
+		[]string{"reason"},
+	)
+	outboxCompensationTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "seckill_outbox_compensation_total",
+			Help: "Total number of outbox final Redis compensation attempts by result.",
+		},
+		[]string{"result"},
+	)
+	outboxReconnectTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "seckill_outbox_reconnect_total",
+			Help: "Total number of RabbitMQ reconnect attempts made by the outbox worker.",
+		},
+	)
+)
+
 func NewMQPublisher(url string) *MQPublisher {
 	return &MQPublisher{url: url}
 }
@@ -181,6 +252,7 @@ func (p *MQPublisher) Publish(ctx context.Context, payload []byte, headers amqp.
 		log.Printf("Outbox发布MQ失败，尝试重连后重试一次: %v", err)
 	}
 
+	outboxReconnectTotal.Inc()
 	if err := p.Connect(); err != nil {
 		return err
 	}
@@ -347,24 +419,48 @@ func claimPendingEvents(ctx context.Context, limit int) ([]OutboxEvent, error) {
 	return events, nil
 }
 
+func updateOutboxPendingGauge(ctx context.Context) {
+	var count int64
+	if err := db.WithContext(ctx).
+		Model(&OutboxEvent{}).
+		Where("status = ?", OutboxStatusPending).
+		Count(&count).Error; err != nil {
+		log.Printf("统计Outbox待投递事件失败: %v", err)
+		return
+	}
+
+	outboxPendingGauge.Set(float64(count))
+}
+
 func processEvent(ctx context.Context, publisher *MQPublisher, event OutboxEvent) {
+	start := time.Now()
+	processResult := "unknown"
+	defer func() {
+		outboxProcessDuration.WithLabelValues(processResult).Observe(time.Since(start).Seconds())
+	}()
+
 	order, exists, err := getOrder(ctx, event.AggregateID)
 	if err != nil {
 		log.Printf("查询订单失败，延迟重试Outbox事件: event_id=%s err=%v", event.EventID, err)
+		processResult = "query_order_failed"
 		scheduleRetry(ctx, event, err)
 		return
 	}
 	if !exists {
+		processResult = "order_missing"
 		markEventFailed(ctx, event, "订单不存在，Outbox事件终止")
 		return
 	}
 	if order.Status == OrderStatusSuccess {
+		processResult = "order_success"
 		if err := markEventSent(ctx, event.EventID); err != nil {
 			log.Printf("订单已成功但标记Outbox已发送失败: event_id=%s err=%v", event.EventID, err)
+			processResult = "mark_sent_failed"
 		}
 		return
 	}
 	if order.Status == OrderStatusFailed {
+		processResult = "order_failed"
 		markEventFailed(ctx, event, "订单已失败，Outbox事件终止")
 		return
 	}
@@ -372,6 +468,7 @@ func processEvent(ctx context.Context, publisher *MQPublisher, event OutboxEvent
 	msg, err := parseOrderMessage(event.Payload)
 	if err != nil {
 		log.Printf("Outbox事件payload非法，终止事件: event_id=%s err=%v", event.EventID, err)
+		processResult = "invalid_payload"
 		markEventAndOrderFailed(ctx, event, "Outbox事件payload非法: "+err.Error())
 		return
 	}
@@ -390,22 +487,30 @@ func processEvent(ctx context.Context, publisher *MQPublisher, event OutboxEvent
 	publishCtx, cancel := context.WithTimeout(traceCtx, 5*time.Second)
 	defer cancel()
 
+	publishStart := time.Now()
 	if err := publisher.Publish(publishCtx, []byte(event.Payload), headers); err != nil {
 		log.Printf("Outbox事件发布失败: event_id=%s retry_count=%d err=%v", event.EventID, event.RetryCount, err)
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "outbox publish failed")
+		processResult = "publish_failed"
+		outboxPublishTotal.WithLabelValues("failed").Inc()
+		outboxPublishDuration.WithLabelValues("failed").Observe(time.Since(publishStart).Seconds())
 		handlePublishFailure(ctx, event, msg, err)
 		return
 	}
+	outboxPublishTotal.WithLabelValues("success").Inc()
+	outboxPublishDuration.WithLabelValues("success").Observe(time.Since(publishStart).Seconds())
 
 	if err := markEventSent(ctx, event.EventID); err != nil {
 		log.Printf("Outbox事件已发布但标记Sent失败，后续可能重复投递: event_id=%s err=%v", event.EventID, err)
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "mark outbox sent failed")
+		processResult = "mark_sent_failed"
 		return
 	}
 
 	span.SetStatus(codes.Ok, "outbox event published")
+	processResult = "published"
 	log.Printf("Outbox事件发布成功: event_id=%s order_id=%s", event.EventID, msg.OrderID)
 }
 
@@ -449,6 +554,7 @@ func parseHeaders(raw string) (amqp.Table, error) {
 func handlePublishFailure(ctx context.Context, event OutboxEvent, msg OrderMessage, publishErr error) {
 	nextRetryCount := event.RetryCount + 1
 	if nextRetryCount < MaxRetryCount {
+		outboxRetryTotal.WithLabelValues("publish").Inc()
 		if err := scheduleRetryWithCount(ctx, event, nextRetryCount, publishErr); err != nil {
 			log.Printf("安排Outbox重试失败: event_id=%s err=%v", event.EventID, err)
 		}
@@ -457,15 +563,19 @@ func handlePublishFailure(ctx context.Context, event OutboxEvent, msg OrderMessa
 
 	reason, err := compensateRedis(ctx, msg)
 	if err != nil {
+		outboxCompensationTotal.WithLabelValues("failed").Inc()
+		outboxRetryTotal.WithLabelValues("compensation").Inc()
 		combinedErr := fmt.Errorf("MQ发布达到最大重试且Redis补偿失败: publish_err=%v compensation_err=%w", publishErr, err)
 		if err := scheduleRetryWithCount(ctx, event, nextRetryCount, combinedErr); err != nil {
 			log.Printf("安排Outbox补偿重试失败: event_id=%s err=%v", event.EventID, err)
 		}
 		return
 	}
+	outboxCompensationTotal.WithLabelValues("success").Inc()
 
 	if err := markEventAndOrderFailed(ctx, event, reason); err != nil {
 		log.Printf("标记Outbox和订单失败状态失败，稍后重试: event_id=%s err=%v", event.EventID, err)
+		outboxRetryTotal.WithLabelValues("mark_failed").Inc()
 		if errRetry := scheduleRetryWithCount(ctx, event, nextRetryCount, err); errRetry != nil {
 			log.Printf("安排Outbox状态重试失败: event_id=%s err=%v", event.EventID, errRetry)
 		}
@@ -476,6 +586,7 @@ func handlePublishFailure(ctx context.Context, event OutboxEvent, msg OrderMessa
 }
 
 func scheduleRetry(ctx context.Context, event OutboxEvent, err error) {
+	outboxRetryTotal.WithLabelValues("process").Inc()
 	if errRetry := scheduleRetryWithCount(ctx, event, event.RetryCount+1, err); errRetry != nil {
 		log.Printf("安排Outbox重试失败: event_id=%s err=%v", event.EventID, errRetry)
 	}
@@ -606,7 +717,12 @@ func runWorker(ctx context.Context, publisher *MQPublisher) {
 		events, err := claimPendingEvents(ctx, BatchSize)
 		if err != nil {
 			log.Printf("扫描Outbox事件失败: %v", err)
+			outboxScanTotal.WithLabelValues("failed").Inc()
+		} else {
+			outboxScanTotal.WithLabelValues("success").Inc()
+			outboxClaimedTotal.Add(float64(len(events)))
 		}
+		updateOutboxPendingGauge(ctx)
 		for _, event := range events {
 			processEvent(ctx, publisher, event)
 		}
@@ -619,6 +735,24 @@ func runWorker(ctx context.Context, publisher *MQPublisher) {
 	}
 }
 
+func startMetricsServer() {
+	port := os.Getenv("SECKILL_OUTBOX_METRICS_PORT")
+	if port == "" {
+		port = "9095"
+	}
+
+	addr := net.JoinHostPort("", port)
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+
+	go func() {
+		log.Printf("Outbox Worker metrics 已启动: %s/metrics", addr)
+		if err := http.ListenAndServe(addr, mux); err != nil {
+			log.Printf("Outbox Worker metrics 启动失败: %v", err)
+		}
+	}()
+}
+
 func main() {
 	shutdown := tracer.InitTracer("outbox-worker", "localhost:4318")
 	defer shutdown(context.Background())
@@ -626,6 +760,7 @@ func main() {
 	config.InitConfig("mq")
 	initDB()
 	initRedis()
+	startMetricsServer()
 
 	mqURL := config.Conf.MQ.URL
 	if mqURL == "" {

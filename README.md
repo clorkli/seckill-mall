@@ -29,7 +29,7 @@
 - Outbox Worker 发布订单消息时已启用 publisher confirm、mandatory 路由检查和消息持久化。
 - Outbox Worker 发送 MQ 失败时会重建 RabbitMQ 连接和 Channel，并按 `outbox_events.retry_count` 延迟重试。
 - MQ Consumer 和 DLQ Consumer 已支持 RabbitMQ connection/channel 断开后的自动重连和重新消费。
-- 已为主队列消费、死信补偿、Ack/Nack、重连和处理耗时增加 Prometheus 业务指标。
+- 已为 Outbox 投递、主队列消费、死信补偿、Ack/Nack、重连、积压和处理耗时增加 Prometheus 业务指标。
 - 已通过 RabbitMQ headers 传播 OpenTelemetry trace context，支持异步 MQ 发布、消费和死信补偿链路在 Jaeger 中关联。
 - MQ Consumer 在 MySQL 事务中推进订单状态并扣减 `product.stock`，让 MySQL 成为最终库存账本。
 - Redis 已开启 AOF，并通过 Docker volume 持久化 `/data`，降低容器重启后的库存丢失风险。
@@ -340,6 +340,8 @@ WHERE id = 1;
 - `SECKILL_JWT_SECRET`
 - `SECKILL_MYSQL_DSN`
 - `SECKILL_MQ_URL`
+- `SECKILL_DLQ_METRICS_PORT`
+- `SECKILL_OUTBOX_METRICS_PORT`
 
 ## 监控与追踪
 
@@ -351,11 +353,25 @@ WHERE id = 1;
 - Order metrics：`http://127.0.0.1:9092/metrics`
 - MQ Consumer metrics：`http://127.0.0.1:9093/metrics`
 - DLQ Consumer metrics：`http://127.0.0.1:9094/metrics`
+- Outbox Worker metrics：`http://127.0.0.1:9095/metrics`
 - RabbitMQ broker metrics：`http://127.0.0.1:15692/metrics`
 
 DLQ Consumer 的 metrics 端口默认是 `9094`，可以通过 `SECKILL_DLQ_METRICS_PORT` 覆盖。
+Outbox Worker 的 metrics 端口默认是 `9095`，可以通过 `SECKILL_OUTBOX_METRICS_PORT` 覆盖。
 
-RabbitMQ broker metrics 由 `rabbitmq_prometheus` 插件提供，Prometheus 会通过 Docker 网络抓取 `rabbitmq:15692`。业务侧 MQ 指标用于观察发布、消费、补偿和重连；broker 侧指标用于观察队列积压、连接数、channel 数、consumer 数、消息 ready/unacked 等 RabbitMQ 自身状态。
+RabbitMQ broker metrics 由 `rabbitmq_prometheus` 插件提供，Prometheus 会通过 Docker 网络抓取 `rabbitmq:15692`。业务侧 MQ 指标用于观察 Outbox 积压、发布、消费、补偿和重连；broker 侧指标用于观察队列积压、连接数、channel 数、consumer 数、消息 ready/unacked 等 RabbitMQ 自身状态。
+
+Outbox Worker 当前暴露的核心指标包括：
+
+- `seckill_outbox_pending_events`：当前待投递 Outbox 事件数量，持续升高说明 Worker 发布慢、RabbitMQ 异常或 Consumer 链路阻塞。
+- `seckill_outbox_scan_total`：Outbox 扫描次数，按 `result` 区分成功和失败。
+- `seckill_outbox_claimed_total`：被 Worker 领取处理的事件总数。
+- `seckill_outbox_publish_total`：RabbitMQ 发布尝试次数，按 `result` 区分成功和失败。
+- `seckill_outbox_publish_duration_seconds`：Outbox 发布 RabbitMQ 的耗时分布。
+- `seckill_outbox_process_duration_seconds`：单条 Outbox 事件端到端处理耗时，按处理结果分类。
+- `seckill_outbox_retry_total`：Outbox 安排重试的次数，按 `reason` 区分发布失败、补偿失败或状态更新失败。
+- `seckill_outbox_compensation_total`：达到最大投递重试后执行 Redis 最终补偿的结果。
+- `seckill_outbox_reconnect_total`：Outbox Worker RabbitMQ 发布连接重建次数。
 
 MQ 异步链路会通过 RabbitMQ headers 传递 OpenTelemetry trace context。Order Service 会把 `traceparent`/`baggage` 写入 `outbox_events.headers`，Outbox Worker 发布 RabbitMQ 消息时恢复这些 headers，MQ Consumer 和 DLQ Consumer 消费消息时提取上下文并创建消费 span，因此 Jaeger 中可以关联下单请求、Outbox 投递、异步落库和死信补偿链路。
 
@@ -368,7 +384,7 @@ MQ 异步链路会通过 RabbitMQ headers 传递 OpenTelemetry trace context。O
 - Product Service 在 `debug` 模式下会启用 `/dev/reset`，该接口会清空 Redis 和 `orders` 表，但当前不会自动恢复 `product.stock` 到初始值。
 - DLQ Consumer 已支持常见落库失败后的 Redis 补偿，但对用户购买记录小于回滚数量等异常状态仍需要人工核查日志。
 - RabbitMQ 生产者侧已启用 publisher confirm、persistent message、mandatory return 和失败重连重试；Consumer 侧已支持连接断开后自动重连。
-- 当前已接入业务侧 MQ 指标和 RabbitMQ broker 指标，但还没有内置 Grafana dashboard 与 Prometheus alert 规则。
+- 当前已接入业务侧 MQ/Outbox 指标和 RabbitMQ broker 指标，但还没有内置 Grafana dashboard 与 Prometheus alert 规则。
 - etcd 注册地址当前偏本地开发场景，服务地址仍以 `127.0.0.1` 为主，多机或容器化部署需要调整。
 
 ## 继续优化方向
@@ -376,7 +392,7 @@ MQ 异步链路会通过 RabbitMQ headers 传递 OpenTelemetry trace context。O
 建议按优先级继续推进：
 
 1. 增加 Grafana dashboard 和 Prometheus alert：展示 MQ publish、consume、DLQ 补偿、重连、队列积压，并配置失败率和积压告警。
-2. 增强 Outbox 可观测性：为 Worker 增加 Prometheus 指标和告警，关注待投递积压、重试次数、最终失败和补偿结果。
+2. 增强 Outbox 告警和仪表盘：围绕待投递积压、发布失败率、重试次数、最终补偿失败和重连次数配置 Prometheus alert 与 Grafana dashboard。
 3. 修复开发重置能力：让 `/dev/reset` 同步恢复 `product.stock` 到测试初始库存，或改成显式传入重置库存。
 4. 扩展订单状态机：增加已取消、超时关闭、人工核查等状态，并记录状态流转历史。
 5. 改善服务注册：etcd 注册地址改为可配置，支持 Docker、WSL、多机部署场景。
