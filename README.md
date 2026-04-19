@@ -6,7 +6,8 @@
 
 - API Gateway：HTTP 入口，负责登录、JWT 鉴权、Sentinel 限流和请求转发。
 - Product Service：商品查询、Redis Lua 原子扣库存、限购记录、库存回滚。
-- Order Service：下单编排，调用商品服务扣库存，写入排队中订单，生成订单消息并投递 RabbitMQ。
+- Order Service：下单编排，调用商品服务扣库存，并同事务写入排队中订单和 Outbox 事件。
+- Outbox Worker：扫描待投递事件，可靠发布 RabbitMQ，并处理重试和最终补偿。
 - MQ Consumer：消费订单消息，使用 MySQL 事务推进订单状态并同步扣减 `product.stock`。
 - DLQ Consumer：消费死信队列，按订单状态补偿 Redis 库存和用户购买记录，并标记失败订单。
 - Common：公共配置、JWT 工具、链路追踪、protobuf 生成代码。
@@ -21,14 +22,14 @@
 - 对非法购买数量做了多层校验，`count <= 0` 会在 Gateway、Order Service、Product Service 被拒绝。
 - 已支持异步订单状态查询，订单会经历 `排队中(status=0)`、`已成功(status=1)`、`已失败(status=2)`。
 - Gateway 提供 `GET /order/:order_id`，用户可查询自己的异步订单处理结果。
-- Order Service 会在同一个 MySQL 事务中写入排队中订单和 `outbox_events` 待投递事件，为 Outbox Worker 接管 MQ 投递做准备。
-- MQ 投递失败时会调用 `RollbackStock`，同时回滚 Redis 库存和用户购买记录。
+- Order Service 会在同一个 MySQL 事务中写入排队中订单和 `outbox_events` 待投递事件。
+- Outbox Worker 会扫描待投递事件并可靠发布 MQ，超过最大重试后补偿 Redis 并标记订单失败。
 - RabbitMQ 主队列配置死信交换机和死信队列，消费失败消息会进入 DLQ。
 - DLQ Consumer 会消费死信队列，若订单不是成功状态，则执行 Redis 补偿并将订单标记为失败。
-- Order Service 发布订单消息时已启用 publisher confirm、mandatory 路由检查和消息持久化。
-- Order Service 发送 MQ 失败时会重建 RabbitMQ 连接和 Channel，并自动重试一次。
+- Outbox Worker 发布订单消息时已启用 publisher confirm、mandatory 路由检查和消息持久化。
+- Outbox Worker 发送 MQ 失败时会重建 RabbitMQ 连接和 Channel，并按 `outbox_events.retry_count` 延迟重试。
 - MQ Consumer 和 DLQ Consumer 已支持 RabbitMQ connection/channel 断开后的自动重连和重新消费。
-- 已为 MQ 发布、主队列消费、死信补偿、Ack/Nack、重连和处理耗时增加 Prometheus 业务指标。
+- 已为主队列消费、死信补偿、Ack/Nack、重连和处理耗时增加 Prometheus 业务指标。
 - 已通过 RabbitMQ headers 传播 OpenTelemetry trace context，支持异步 MQ 发布、消费和死信补偿链路在 Jaeger 中关联。
 - MQ Consumer 在 MySQL 事务中推进订单状态并扣减 `product.stock`，让 MySQL 成为最终库存账本。
 - Redis 已开启 AOF，并通过 Docker volume 持久化 `/data`，降低容器重启后的库存丢失风险。
@@ -45,7 +46,8 @@ Client
   -> gRPC / etcd
   -> Product Service (Redis + Lua)
   -> Order Service
-  -> MySQL (orders: pending)
+  -> MySQL (orders: pending + outbox_events: pending)
+  -> Outbox Worker
   -> RabbitMQ
   -> MQ Consumer
   -> MySQL (orders: success + product.stock)
@@ -67,8 +69,8 @@ RabbitMQ dead_queue
 5. Order Service 校验购买数量，并调用 `ProductService.DeductStock`。
 6. Product Service 使用 Redis Lua 原子判断库存、限购记录，并扣减 Redis 库存。
 7. Order Service 查询商品价格，生成订单号，并写入 `orders.status = 0` 的排队中订单。
-8. Order Service 将订单消息投递到 RabbitMQ，消息中包含 `order_id`、`user_id`、`product_id`、`count` 和 `amount`。
-9. 如果 MQ 投递失败，Order Service 调用 `RollbackStock`，恢复 Redis 库存和用户购买记录，并把订单标记为失败。
+8. Order Service 在同一个 MySQL 事务中写入 `outbox_events.status = 0` 的待投递事件，事件中包含订单消息和 trace headers。
+9. Outbox Worker 扫描待投递事件，将订单消息投递到 RabbitMQ，消息中包含 `order_id`、`user_id`、`product_id`、`count` 和 `amount`。
 10. MQ Consumer 消费订单消息，校验消息格式和 `count`。
 11. MQ Consumer 开启 MySQL 事务，锁定排队中订单，扣减 `product.stock`，并把订单标记为成功。
 12. 事务成功则 Ack；失败则 Nack 且不重回队列，消息进入死信队列。
@@ -86,27 +88,37 @@ RabbitMQ dead_queue
 ```text
 Redis 扣减成功
 -> Order Service 同事务写入 Pending 订单和 Outbox Pending 事件
--> MQ 投递成功
+-> Outbox Worker 投递 MQ 成功
 -> Outbox 事件更新为 Sent
 -> Consumer 事务扣 MySQL product.stock
 -> Consumer 事务更新订单为 Success
 -> Ack
 ```
 
-如果 MQ 投递失败：
+如果 Order Service 写入 Outbox 后立刻崩溃：
 
 ```text
 Redis 已扣减
 -> Pending 订单和 Outbox Pending 事件已写入
--> MQ 投递失败
--> RollbackStock
+-> Outbox Worker 后台扫描 Pending 事件
+-> Outbox Worker 投递 MQ
+-> 投递成功后 Outbox 事件更新为 Sent
+```
+
+如果 Outbox Worker 达到最大重试仍无法投递：
+
+```text
+Redis 已扣减
+-> Pending 订单和 Outbox Pending 事件已写入
+-> Outbox Worker 多次投递失败
+-> Redis 幂等补偿
 -> Redis 库存恢复
 -> Redis 用户购买记录恢复
 -> 订单更新为 Failed
 -> Outbox 事件更新为 Failed
 ```
 
-当前 Outbox 处于过渡阶段：Order Service 已经写入 `outbox_events` 并维护同步 MQ 发布结果，但 MQ 投递仍由请求链路同步完成。后续引入独立 `outbox_worker` 后，可以改为由 Worker 扫描 `status = 0` 的事件并可靠投递 MQ。
+当前 MQ 投递已由 Outbox Worker 完全接管。Order Service 不再直接连接 RabbitMQ，请求链路只负责 Redis 扣减和 MySQL 事务写入。只要 `orders` 和 `outbox_events` 提交成功，即使 Order Service 随后崩溃，Worker 也能继续投递未发送事件。
 
 如果 Consumer 落库失败：
 
@@ -145,6 +157,7 @@ export SECKILL_MQ_URL="amqp://guest:guest@127.0.0.1:5672/"
 ```bash
 go run product_service/main.go
 go run order_service/main.go
+go run outbox_worker/main.go
 go run mq_consumer/main.go
 go run dlq_consumer/main.go
 go run api_gateway/main.go
@@ -210,6 +223,7 @@ CREATE TABLE IF NOT EXISTS outbox_events (
 	aggregate_id VARCHAR(64) NOT NULL,
 	event_type VARCHAR(64) NOT NULL,
 	payload JSON NOT NULL,
+	headers JSON,
 	status INT NOT NULL DEFAULT 0,
 	retry_count INT NOT NULL DEFAULT 0,
 	next_retry_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -245,6 +259,7 @@ CREATE TABLE IF NOT EXISTS outbox_events (
 	aggregate_id VARCHAR(64) NOT NULL,
 	event_type VARCHAR(64) NOT NULL,
 	payload JSON NOT NULL,
+	headers JSON,
 	status INT NOT NULL DEFAULT 0,
 	retry_count INT NOT NULL DEFAULT 0,
 	next_retry_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -255,6 +270,13 @@ CREATE TABLE IF NOT EXISTS outbox_events (
 	KEY idx_status_next_retry (status, next_retry_at),
 	KEY idx_aggregate_id (aggregate_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+如果你已经创建过旧版 `outbox_events` 表，需要补充 trace headers 字段：
+
+```sql
+ALTER TABLE outbox_events
+ADD COLUMN headers JSON AFTER payload;
 ```
 
 ## 联调验证
@@ -335,14 +357,14 @@ DLQ Consumer 的 metrics 端口默认是 `9094`，可以通过 `SECKILL_DLQ_METR
 
 RabbitMQ broker metrics 由 `rabbitmq_prometheus` 插件提供，Prometheus 会通过 Docker 网络抓取 `rabbitmq:15692`。业务侧 MQ 指标用于观察发布、消费、补偿和重连；broker 侧指标用于观察队列积压、连接数、channel 数、consumer 数、消息 ready/unacked 等 RabbitMQ 自身状态。
 
-MQ 异步链路会通过 RabbitMQ headers 传递 OpenTelemetry trace context。Order Service 发布订单消息时注入 `traceparent`/`baggage`，MQ Consumer 和 DLQ Consumer 消费消息时提取上下文并创建消费 span，因此 Jaeger 中可以关联下单请求、MQ 发布、异步落库和死信补偿链路。
+MQ 异步链路会通过 RabbitMQ headers 传递 OpenTelemetry trace context。Order Service 会把 `traceparent`/`baggage` 写入 `outbox_events.headers`，Outbox Worker 发布 RabbitMQ 消息时恢复这些 headers，MQ Consumer 和 DLQ Consumer 消费消息时提取上下文并创建消费 span，因此 Jaeger 中可以关联下单请求、Outbox 投递、异步落库和死信补偿链路。
 
 ## 当前注意事项
 
 - `mq_consumer` 对旧格式 MQ 消息不兼容。旧消息没有 `count` 字段，会被识别为非法消息并进入死信队列。
 - `dlq_consumer` 对旧格式或字段缺失的死信消息无法自动补偿，会记录日志并确认消息，避免毒丸消息阻塞队列。
 - Order Service 会写入排队中订单，已有旧表需要先执行 `orders` 表字段升级 SQL，否则会因为缺少 `count`、`fail_reason` 或 `updated_at` 导致写入失败。
-- 当前 Outbox 只完成表结构和事件写入，尚未接入独立 Worker；同步 MQ 投递仍然保留，避免切换过猛。
+- Outbox Worker 已完全接管 MQ 投递，Order Service 不再直接依赖 RabbitMQ；启动服务时需要确保 `outbox_worker` 正常运行，否则订单会停留在 `status = 0` 排队中。
 - Product Service 在 `debug` 模式下会启用 `/dev/reset`，该接口会清空 Redis 和 `orders` 表，但当前不会自动恢复 `product.stock` 到初始值。
 - DLQ Consumer 已支持常见落库失败后的 Redis 补偿，但对用户购买记录小于回滚数量等异常状态仍需要人工核查日志。
 - RabbitMQ 生产者侧已启用 publisher confirm、persistent message、mandatory return 和失败重连重试；Consumer 侧已支持连接断开后自动重连。
@@ -354,7 +376,7 @@ MQ 异步链路会通过 RabbitMQ headers 传递 OpenTelemetry trace context。O
 建议按优先级继续推进：
 
 1. 增加 Grafana dashboard 和 Prometheus alert：展示 MQ publish、consume、DLQ 补偿、重连、队列积压，并配置失败率和积压告警。
-2. 完成 Outbox Worker：扫描 `outbox_events.status = 0` 的事件，发布 MQ，处理重试、失败补偿和状态更新。
+2. 增强 Outbox 可观测性：为 Worker 增加 Prometheus 指标和告警，关注待投递积压、重试次数、最终失败和补偿结果。
 3. 修复开发重置能力：让 `/dev/reset` 同步恢复 `product.stock` 到测试初始库存，或改成显式传入重置库存。
 4. 扩展订单状态机：增加已取消、超时关闭、人工核查等状态，并记录状态流转历史。
 5. 改善服务注册：etcd 注册地址改为可配置，支持 Docker、WSL、多机部署场景。

@@ -9,13 +9,9 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
-	"sync"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	amqp "github.com/rabbitmq/amqp091-go"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"gorm.io/driver/mysql"
@@ -32,16 +28,13 @@ import (
 	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
 	otelgrpc "go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
 )
 
 const (
 	SERVICE_NAME = "seckill/order"
 
 	PRODUCT_SERVICE_NAME = "etcd:///seckill/product"
-	MQ_QUEUE_NAME        = "seckill_order_queue"
-	DeadExchange         = "dlx_exchange" // 死信交换机
-	DeadRoutingKey       = "dead_key"
 )
 
 const (
@@ -52,8 +45,6 @@ const (
 
 const (
 	OutboxStatusPending int32 = 0
-	OutboxStatusSent    int32 = 1
-	OutboxStatusFailed  int32 = 2
 
 	OutboxAggregateOrder    = "order"
 	OutboxEventOrderCreated = "order.created"
@@ -92,6 +83,7 @@ type OutboxEvent struct {
 	AggregateID   string    `gorm:"column:aggregate_id;not null"`
 	EventType     string    `gorm:"column:event_type;not null"`
 	Payload       string    `gorm:"column:payload;type:json;not null"`
+	Headers       string    `gorm:"column:headers;type:json"`
 	Status        int32     `gorm:"column:status;default:0"`
 	RetryCount    int       `gorm:"column:retry_count;default:0"`
 	NextRetryAt   time.Time `gorm:"column:next_retry_at;not null"`
@@ -103,195 +95,7 @@ type OutboxEvent struct {
 func (OutboxEvent) TableName() string { return "outbox_events" }
 
 var productClient pb.ProductServiceClient
-var mqPublisher *MQPublisher
 var db *gorm.DB
-
-var (
-	mqPublishTotal = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "seckill_mq_publish_total",
-			Help: "Total number of RabbitMQ publish attempts by result.",
-		},
-		[]string{"result"},
-	)
-	mqPublishRetryTotal = promauto.NewCounter(
-		prometheus.CounterOpts{
-			Name: "seckill_mq_publish_retry_total",
-			Help: "Total number of RabbitMQ publish retries.",
-		},
-	)
-	mqPublishReturnTotal = promauto.NewCounter(
-		prometheus.CounterOpts{
-			Name: "seckill_mq_publish_return_total",
-			Help: "Total number of RabbitMQ returned messages.",
-		},
-	)
-	mqPublishConfirmNackTotal = promauto.NewCounter(
-		prometheus.CounterOpts{
-			Name: "seckill_mq_publish_confirm_nack_total",
-			Help: "Total number of RabbitMQ publisher confirm nacks.",
-		},
-	)
-	mqPublisherReconnectTotal = promauto.NewCounter(
-		prometheus.CounterOpts{
-			Name: "seckill_mq_publisher_reconnect_total",
-			Help: "Total number of RabbitMQ publisher reconnect attempts.",
-		},
-	)
-	mqPublishDuration = promauto.NewHistogram(
-		prometheus.HistogramOpts{
-			Name:    "seckill_mq_publish_duration_seconds",
-			Help:    "RabbitMQ publish duration in seconds.",
-			Buckets: prometheus.DefBuckets,
-		},
-	)
-)
-
-type MQPublisher struct {
-	mu       sync.Mutex
-	url      string
-	conn     *amqp.Connection
-	channel  *amqp.Channel
-	confirms <-chan amqp.Confirmation
-	returns  <-chan amqp.Return
-}
-
-func NewMQPublisher(url string) *MQPublisher {
-	return &MQPublisher{url: url}
-}
-
-func (p *MQPublisher) Connect() error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	return p.connectLocked()
-}
-
-func (p *MQPublisher) connectLocked() error {
-	p.closeLocked()
-
-	conn, err := amqp.Dial(p.url)
-	if err != nil {
-		return fmt.Errorf("连接RabbitMQ失败: %w", err)
-	}
-
-	ch, err := conn.Channel()
-	if err != nil {
-		conn.Close()
-		return fmt.Errorf("创建MQ通道失败: %w", err)
-	}
-
-	args := amqp.Table{
-		"x-dead-letter-exchange":    DeadExchange,
-		"x-dead-letter-routing-key": DeadRoutingKey,
-	}
-
-	if _, err := ch.QueueDeclare(MQ_QUEUE_NAME, true, false, false, false, args); err != nil {
-		ch.Close()
-		conn.Close()
-		return fmt.Errorf("声明队列失败: %w", err)
-	}
-
-	if err := ch.Confirm(false); err != nil {
-		ch.Close()
-		conn.Close()
-		return fmt.Errorf("开启Publisher Confirm失败: %w", err)
-	}
-
-	p.conn = conn
-	p.channel = ch
-	p.confirms = ch.NotifyPublish(make(chan amqp.Confirmation, 1))
-	p.returns = ch.NotifyReturn(make(chan amqp.Return, 1))
-
-	return nil
-}
-
-func (p *MQPublisher) closeLocked() {
-	if p.channel != nil {
-		_ = p.channel.Close()
-		p.channel = nil
-	}
-	if p.conn != nil {
-		_ = p.conn.Close()
-		p.conn = nil
-	}
-	p.confirms = nil
-	p.returns = nil
-}
-
-func (p *MQPublisher) PublishOrder(ctx context.Context, body []byte, headers amqp.Table) (err error) {
-	start := time.Now()
-	defer func() {
-		mqPublishDuration.Observe(time.Since(start).Seconds())
-		if err != nil {
-			mqPublishTotal.WithLabelValues("failed").Inc()
-		} else {
-			mqPublishTotal.WithLabelValues("success").Inc()
-		}
-	}()
-
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if err := p.publishLocked(ctx, body, headers); err == nil {
-		return nil
-	} else {
-		log.Printf("MQ发布失败，尝试重连后重试一次: %v", err)
-	}
-
-	mqPublishRetryTotal.Inc()
-	mqPublisherReconnectTotal.Inc()
-	if err := p.connectLocked(); err != nil {
-		return err
-	}
-
-	return p.publishLocked(ctx, body, headers)
-}
-
-func (p *MQPublisher) publishLocked(ctx context.Context, body []byte, headers amqp.Table) error {
-	if p.channel == nil {
-		if err := p.connectLocked(); err != nil {
-			return err
-		}
-	}
-
-	if err := p.channel.PublishWithContext(
-		ctx,
-		"",
-		MQ_QUEUE_NAME,
-		true,
-		false,
-		amqp.Publishing{
-			ContentType:  "application/json",
-			DeliveryMode: amqp.Persistent,
-			Headers:      headers,
-			Timestamp:    time.Now(),
-			Body:         body,
-		},
-	); err != nil {
-		return fmt.Errorf("发布消息失败: %w", err)
-	}
-
-	select {
-	case ret, ok := <-p.returns:
-		if !ok {
-			return fmt.Errorf("RabbitMQ return channel 已关闭")
-		}
-		mqPublishReturnTotal.Inc()
-		return fmt.Errorf("消息无法路由: reply_code=%d reply_text=%s exchange=%s routing_key=%s", ret.ReplyCode, ret.ReplyText, ret.Exchange, ret.RoutingKey)
-	case confirm, ok := <-p.confirms:
-		if !ok {
-			return fmt.Errorf("RabbitMQ confirm channel 已关闭")
-		}
-		if !confirm.Ack {
-			mqPublishConfirmNackTotal.Inc()
-			return fmt.Errorf("RabbitMQ Nack delivery_tag=%d", confirm.DeliveryTag)
-		}
-		return nil
-	case <-ctx.Done():
-		return fmt.Errorf("等待RabbitMQ确认超时或取消: %w", ctx.Err())
-	}
-}
 
 type server struct {
 	pb.UnimplementedOrderServiceServer
@@ -335,7 +139,18 @@ func truncateText(s string, maxLen int) string {
 	return string(runes[:maxLen])
 }
 
-func createPendingOrderWithOutbox(ctx context.Context, msg OrderMessage, payload []byte) error {
+func marshalTraceHeaders(ctx context.Context) string {
+	headers := map[string]string{}
+	otel.GetTextMapPropagator().Inject(ctx, propagation.MapCarrier(headers))
+
+	body, err := json.Marshal(headers)
+	if err != nil {
+		return "{}"
+	}
+	return string(body)
+}
+
+func createPendingOrderWithOutbox(ctx context.Context, msg OrderMessage, payload []byte, headers string) error {
 	order := Order{
 		OrderID:   msg.OrderID,
 		UserID:    msg.UserID,
@@ -350,6 +165,7 @@ func createPendingOrderWithOutbox(ctx context.Context, msg OrderMessage, payload
 		AggregateID:   msg.OrderID,
 		EventType:     OutboxEventOrderCreated,
 		Payload:       string(payload),
+		Headers:       headers,
 		Status:        OutboxStatusPending,
 		NextRetryAt:   time.Now(),
 	}
@@ -364,26 +180,6 @@ func createPendingOrderWithOutbox(ctx context.Context, msg OrderMessage, payload
 
 		return nil
 	})
-}
-
-func markOutboxSent(ctx context.Context, orderID string) error {
-	return db.WithContext(ctx).
-		Model(&OutboxEvent{}).
-		Where("event_id = ? AND status = ?", orderCreatedEventID(orderID), OutboxStatusPending).
-		Updates(map[string]any{
-			"status":     OutboxStatusSent,
-			"last_error": "",
-		}).Error
-}
-
-func markOutboxFailed(ctx context.Context, orderID string, err error) error {
-	return db.WithContext(ctx).
-		Model(&OutboxEvent{}).
-		Where("event_id = ? AND status = ?", orderCreatedEventID(orderID), OutboxStatusPending).
-		Updates(map[string]any{
-			"status":     OutboxStatusFailed,
-			"last_error": truncateText(err.Error(), 255),
-		}).Error
 }
 
 func markOrderFailed(ctx context.Context, orderID string, userID int64, reason string) error {
@@ -421,15 +217,6 @@ func markPendingOrderFailed(orderID string, userID int64, reason string) {
 
 	if err := markOrderFailed(updateCtx, orderID, userID, reason); err != nil {
 		log.Printf("X! 标记订单失败状态失败，请人工介入: order_id=%s err=%v", orderID, err)
-	}
-}
-
-func markOutboxEventFailed(orderID string, err error) {
-	updateCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	if errUpdate := markOutboxFailed(updateCtx, orderID, err); errUpdate != nil {
-		log.Printf("X! 标记Outbox事件失败状态失败，请人工介入: order_id=%s err=%v", orderID, errUpdate)
 	}
 }
 
@@ -497,43 +284,17 @@ func (s *server) CreateOrder(ctx context.Context, req *pb.CreateOrderRequest) (*
 		return nil, fmt.Errorf("序列化订单消息失败: %w", err)
 	}
 
-	if err := createPendingOrderWithOutbox(ctx, orderMsg, body); err != nil {
+	outboxCtx, outboxSpan := otel.Tracer("order-service").Start(ctx, "outbox.enqueue_order")
+	defer outboxSpan.End()
+	headers := marshalTraceHeaders(outboxCtx)
+
+	if err := createPendingOrderWithOutbox(outboxCtx, orderMsg, body, headers); err != nil {
+		outboxSpan.RecordError(err)
 		rollbackStockAndMarkFailed(orderID, req.ProductId, req.UserId, req.Count, "创建排队订单和Outbox事件失败")
 		return nil, fmt.Errorf("创建排队订单和Outbox事件失败: %w", err)
 	}
 
-	// 发送消息到 RabbitMQ
-	publishTraceCtx, publishSpan := otel.Tracer("order-service").Start(ctx, "rabbitmq.publish_order")
-	headers := tracer.InjectAMQPHeaders(publishTraceCtx, nil)
-	defer publishSpan.End()
-
-	publishCtx, cancelPublish := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancelPublish()
-
-	err = mqPublisher.PublishOrder(publishCtx, body, headers)
-
-	//发MQ失败应该回滚Redis库存，这里先打日志
-	if err != nil {
-		publishSpan.RecordError(err)
-		publishSpan.SetStatus(codes.Error, "publish order message failed")
-		log.Printf("发送MQ失败: %v，正在执行回滚...", err)
-	} else {
-		publishSpan.SetStatus(codes.Ok, "publish order message confirmed")
-	}
-
-	if err != nil {
-		rollbackStockAndMarkFailed(orderID, req.ProductId, req.UserId, req.Count, "MQ发送失败")
-		markOutboxEventFailed(orderID, err)
-		return nil, fmt.Errorf("系统繁忙，请稍后重试")
-	}
-
-	updateOutboxCtx, cancelUpdateOutbox := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancelUpdateOutbox()
-	if err := markOutboxSent(updateOutboxCtx, orderID); err != nil {
-		log.Printf("标记Outbox事件已发送失败，后续Worker可能重复投递: order_id=%s err=%v", orderID, err)
-	}
-
-	fmt.Printf("下单请求已发送到MQ，订单ID: %s\n", orderID)
+	fmt.Printf("下单请求已写入Outbox，订单ID: %s\n", orderID)
 
 	return &pb.CreateOrderResponse{
 		OrderId: orderID,
@@ -606,21 +367,6 @@ func initDB() {
 	fmt.Println("已连接到 MySQL (Order Query Ready)")
 }
 
-// 初始化RabbitMQ连接
-func initMQ() {
-	mqURL := config.Conf.MQ.URL
-	if mqURL == "" {
-		log.Fatalf("mq.url 为空，请在 config/order.yaml 设置或通过环境变量 SECKILL_MQ_URL 注入")
-	}
-
-	mqPublisher = NewMQPublisher(mqURL)
-	if err := mqPublisher.Connect(); err != nil {
-		log.Fatalf("初始化RabbitMQ发布器失败: %v", err)
-	}
-
-	fmt.Println("已连接到 RabbitMQ (MQ Publisher Ready)")
-}
-
 // 初始化Product Client
 func initProductClient() {
 	etcdAddr := config.Conf.Etcd.Addr
@@ -690,7 +436,6 @@ func main() {
 	myAddr := "127.0.0.1:" + port
 
 	initDB()
-	initMQ()
 	initProductClient()
 	registerEtcd(myAddr)
 
