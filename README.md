@@ -32,9 +32,63 @@
 - 已为 Outbox 投递、主队列消费、死信补偿、Ack/Nack、重连、积压和处理耗时增加 Prometheus 业务指标。
 - 已通过 RabbitMQ headers 传播 OpenTelemetry trace context，支持异步 MQ 发布、消费和死信补偿链路在 Jaeger 中关联。
 - MQ Consumer 在 MySQL 事务中推进订单状态并扣减 `product.stock`，让 MySQL 成为最终库存账本。
+- MySQL 已纳入 `docker-compose.yaml`，首次创建 `mysql_data` volume 时会自动执行 `deploy/mysql/init.sql`。
 - Redis 已开启 AOF，并通过 Docker volume 持久化 `/data`，降低容器重启后的库存丢失风险。
 - 接入 OpenTelemetry + Jaeger 做链路追踪。
 - 接入 Prometheus + Grafana 做基础监控。
+- 各服务入口已拆分为按职责组织的多文件结构，`main.go` 只保留启动装配。
+- 已开始补充单元测试，目前覆盖 Outbox payload 解析和重试延迟计算。
+
+## 目录结构
+
+```text
+api_gateway/
+  main.go          启动装配
+  clients.go       etcd / gRPC client 初始化
+  routes.go        HTTP 路由
+  sentinel.go      Sentinel 限流规则
+  server.go        HTTP server 启动
+  middleware/      JWT 鉴权和 Sentinel 中间件
+
+product_service/
+  main.go          启动装配
+  stock.go         Redis Lua 扣库存和回滚
+  service.go       Product gRPC handler
+  infrastructure.go MySQL / Redis / etcd / 库存预热
+  metrics.go       Prometheus 和 debug reset
+
+order_service/
+  main.go          启动装配
+  service.go       CreateOrder / GetOrder
+  outbox.go        同事务写 orders 和 outbox_events
+  product_client.go Product gRPC client 和库存回滚 RPC
+  compensation.go  下单失败补偿编排
+  repository.go    订单状态更新
+
+outbox_worker/
+  main.go          启动装配
+  worker.go        Outbox 扫描和发布主流程
+  mq.go            RabbitMQ publisher confirm / mandatory return
+  repository.go    Outbox claim / retry / 状态更新
+  compensation.go  Redis 最终补偿
+  *_test.go        轻量单元测试
+
+mq_consumer/
+  main.go          启动装配
+  mq.go            主队列声明和消费循环
+  handler.go       Ack / Nack / trace / 消息处理分支
+  repository.go    MySQL 事务扣库存和订单落库
+
+dlq_consumer/
+  main.go          启动装配
+  mq.go            死信队列消费循环
+  handler.go       死信消息校验和状态分支
+  compensation.go  Redis 回滚和失败订单标记
+
+deploy/
+  mysql/init.sql   本地 MySQL 初始化 SQL
+  prometheus.yml   Prometheus 抓取配置
+```
 
 ## 整体架构
 
@@ -155,19 +209,21 @@ export SECKILL_MQ_URL="amqp://guest:guest@127.0.0.1:5672/"
 5. 按顺序启动服务：
 
 ```bash
-go run product_service/main.go
-go run order_service/main.go
-go run outbox_worker/main.go
-go run mq_consumer/main.go
-go run dlq_consumer/main.go
-go run api_gateway/main.go
+go run ./product_service
+go run ./order_service
+go run ./outbox_worker
+go run ./mq_consumer
+go run ./dlq_consumer
+go run ./api_gateway
 ```
 
 6. 可选：运行压测脚本：
 
 ```bash
-go run stress_test/main.go
+go run ./stress_test
 ```
+
+服务已经拆成多文件 package，启动时必须使用 `go run ./服务目录`。不要再使用 `go run product_service/main.go` 这类单文件命令，否则 Go 只会编译该文件，找不到同目录拆出去的函数和类型。
 
 ## MySQL 初始化
 
@@ -287,6 +343,40 @@ WHERE id = 1;
 
 如果订单成功消费，`orders.status` 会从 `0` 更新为 `1`，`product.stock` 会同步减少。
 
+## 测试与静态检查
+
+当前项目已开始补充单元测试，优先覆盖不依赖外部组件的核心逻辑。
+
+运行全部测试：
+
+```bash
+go test ./...
+```
+
+运行指定包并显示子测试：
+
+```bash
+go test ./outbox_worker -v
+```
+
+运行静态检查：
+
+```bash
+go vet ./...
+```
+
+当前已有测试：
+
+- `outbox_worker/worker_test.go`：测试 Outbox 订单消息 payload 解析。
+- `outbox_worker/repository_test.go`：测试 Outbox 重试退避时间和最大延迟上限。
+
+后续建议继续补：
+
+- `product_service/stock.go`：Redis Lua 扣库存、限购和回滚。
+- `mq_consumer/repository.go`：MySQL 事务扣库存和订单幂等落库。
+- `dlq_consumer/compensation.go`：死信补偿分支。
+- `outbox_worker/worker.go`：Outbox 发布失败、重试和最终补偿分支。
+
 ## 配置说明
 
 配置文件位于 `config/` 目录，不同服务使用不同配置文件：
@@ -341,6 +431,7 @@ MQ 异步链路会通过 RabbitMQ headers 传递 OpenTelemetry trace context。O
 - `mq_consumer` 对旧格式 MQ 消息不兼容。旧消息没有 `count` 字段，会被识别为非法消息并进入死信队列。
 - `dlq_consumer` 对旧格式或字段缺失的死信消息无法自动补偿，会记录日志并确认消息，避免毒丸消息阻塞队列。
 - Order Service 会写入排队中订单，已有旧表需要先执行 `orders` 表字段升级 SQL，否则会因为缺少 `count`、`fail_reason` 或 `updated_at` 导致写入失败。
+- 服务已拆成多文件 package，本地启动请使用 `go run ./api_gateway`、`go run ./product_service` 这种目录形式。
 - Outbox Worker 已完全接管 MQ 投递，Order Service 不再直接依赖 RabbitMQ；启动服务时需要确保 `outbox_worker` 正常运行，否则订单会停留在 `status = 0` 排队中。
 - Product Service 在 `debug` 模式下会启用 `/dev/reset`，该接口会清空 Redis 和 `orders` 表，但当前不会自动恢复 `product.stock` 到初始值。
 - DLQ Consumer 已支持常见落库失败后的 Redis 补偿，但对用户购买记录小于回滚数量等异常状态仍需要人工核查日志。
@@ -357,8 +448,8 @@ MQ 异步链路会通过 RabbitMQ headers 传递 OpenTelemetry trace context。O
 3. 修复开发重置能力：让 `/dev/reset` 同步恢复 `product.stock` 到测试初始库存，或改成显式传入重置库存。
 4. 扩展订单状态机：增加已取消、超时关闭、人工核查等状态，并记录状态流转历史。
 5. 改善服务注册：etcd 注册地址改为可配置，支持 Docker、WSL、多机部署场景。
-6. 增加自动化测试：补充 Redis Lua、库存回滚、Consumer 幂等、MySQL 事务扣库存、DLQ 补偿、MQ 发布确认、消费端重连和 MQ trace propagation 等核心测试。
-7. 增加数据库迁移并完善安全边界：引入 migration 工具，关闭生产环境 `/dev/reset`，JWT secret 强度校验，敏感日志脱敏。
+6. 扩展自动化测试：补充 Redis Lua、库存回滚、Consumer 幂等、MySQL 事务扣库存、DLQ 补偿、MQ 发布确认、消费端重连和 MQ trace propagation 等核心测试。
+7. 增加数据库迁移并完善安全边界：当前已有 `deploy/mysql/init.sql`，后续可引入 migration 工具，关闭生产环境 `/dev/reset`，JWT secret 强度校验，敏感日志脱敏。
 
 ## 技术栈
 
