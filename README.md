@@ -137,13 +137,13 @@ Redis 重启或数据丢失后，Product Service 会从 MySQL 的 `product.stock
 ## 环境准备
 
 1. 安装 Docker 和 Docker Compose。
-2. 启动中间件：
+2. 启动 MySQL 和中间件：
 
 ```bash
 docker compose up -d
 ```
 
-3. 准备 MySQL 数据库和表结构。
+3. 首次启动时，MySQL 会自动执行 `deploy/mysql/init.sql`，创建 `seckill` 库、核心表和一条测试商品。
 4. 设置必要环境变量：
 
 ```bash
@@ -171,72 +171,33 @@ go run stress_test/main.go
 
 ## MySQL 初始化
 
-### 1. 准备 MySQL
-
-方式 A：使用 Docker 启动 MySQL。
+项目已在 `docker-compose.yaml` 中内置 MySQL 8.0，初始化 SQL 位于 `deploy/mysql/init.sql`。
 
 ```bash
-docker run -d --name seckill-mysql \
-  -p 3306:3306 \
-  -e MYSQL_ROOT_PASSWORD=123456 \
-  -e MYSQL_DATABASE=seckill \
-  mysql:8.0 --default-authentication-plugin=mysql_native_password
+docker compose up -d mysql
 ```
 
-方式 B：使用本机已有 MySQL。
+MySQL 容器第一次创建 `mysql_data` volume 时，会自动执行 `deploy/mysql/init.sql`，创建：
 
-确认可以连接 `127.0.0.1:3306`，且账号有建库建表权限。
+- `product`：商品和最终库存账本。
+- `orders`：异步订单状态。
+- `outbox_events`：Outbox 可靠投递事件。
+- 测试商品：`id=1`，`stock=100`。
 
-### 2. 执行初始化 SQL
+如果你修改了初始化 SQL，并且想在本地重新执行整套初始化，可以删除 MySQL volume 后重启：
 
-```sql
-CREATE DATABASE IF NOT EXISTS seckill DEFAULT CHARACTER SET utf8mb4;
-USE seckill;
+```bash
+docker compose down
+docker volume rm seckill-mall_mysql_data
+docker compose up -d mysql
+```
 
-CREATE TABLE IF NOT EXISTS product (
-	id BIGINT PRIMARY KEY AUTO_INCREMENT,
-	name VARCHAR(255) NOT NULL,
-	price DECIMAL(10,2) NOT NULL DEFAULT 0.00,
-	stock INT NOT NULL DEFAULT 0,
-	description VARCHAR(255) DEFAULT ''
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+注意：删除 volume 会清空本地 MySQL 数据。
 
-CREATE TABLE IF NOT EXISTS orders (
-	id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
-	order_id VARCHAR(64) NOT NULL,
-	user_id BIGINT NOT NULL,
-	product_id BIGINT NOT NULL,
-	count INT NOT NULL DEFAULT 1,
-	amount DECIMAL(10,2) NOT NULL,
-	status INT NOT NULL DEFAULT 0,
-	fail_reason VARCHAR(255) DEFAULT '',
-	created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-	updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-	UNIQUE KEY uk_order_id (order_id),
-	KEY idx_user_id (user_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+也可以手动执行初始化脚本：
 
-CREATE TABLE IF NOT EXISTS outbox_events (
-	id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
-	event_id VARCHAR(64) NOT NULL,
-	aggregate_type VARCHAR(32) NOT NULL,
-	aggregate_id VARCHAR(64) NOT NULL,
-	event_type VARCHAR(64) NOT NULL,
-	payload JSON NOT NULL,
-	headers JSON,
-	status INT NOT NULL DEFAULT 0,
-	retry_count INT NOT NULL DEFAULT 0,
-	next_retry_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-	last_error VARCHAR(255) DEFAULT '',
-	created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-	updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-	UNIQUE KEY uk_event_id (event_id),
-	KEY idx_status_next_retry (status, next_retry_at),
-	KEY idx_aggregate_id (aggregate_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-
-INSERT INTO product (name, price, stock, description)
-VALUES ('iPhone 15', 6999.00, 100, '秒杀测试商品');
+```bash
+docker exec -i seckill-mysql mysql -uroot -p123456 seckill < deploy/mysql/init.sql
 ```
 
 如果你已有旧版 `orders` 表，需要先补充订单状态查询所需字段：

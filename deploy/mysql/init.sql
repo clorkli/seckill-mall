@@ -1,0 +1,51 @@
+CREATE DATABASE IF NOT EXISTS seckill DEFAULT CHARACTER SET utf8mb4;
+USE seckill;
+
+CREATE TABLE IF NOT EXISTS product (
+	id BIGINT PRIMARY KEY AUTO_INCREMENT,
+	name VARCHAR(255) NOT NULL,
+	price DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+	stock INT NOT NULL DEFAULT 0,
+	description VARCHAR(255) DEFAULT ''
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS orders (
+	id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+	order_id VARCHAR(64) NOT NULL,
+	user_id BIGINT NOT NULL,
+	product_id BIGINT NOT NULL,
+	count INT NOT NULL DEFAULT 1,
+	amount DECIMAL(10,2) NOT NULL,
+	status INT NOT NULL DEFAULT 0,
+	fail_reason VARCHAR(255) DEFAULT '',
+	created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+	UNIQUE KEY uk_order_id (order_id),
+	KEY idx_user_id (user_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS outbox_events (
+	id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+	event_id VARCHAR(64) NOT NULL,
+	aggregate_type VARCHAR(32) NOT NULL,
+	aggregate_id VARCHAR(64) NOT NULL,
+	event_type VARCHAR(64) NOT NULL,
+	payload JSON NOT NULL,
+	headers JSON,
+	status INT NOT NULL DEFAULT 0,
+	retry_count INT NOT NULL DEFAULT 0,
+	next_retry_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	last_error VARCHAR(255) DEFAULT '',
+	created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+	UNIQUE KEY uk_event_id (event_id),
+	KEY idx_status_next_retry (status, next_retry_at),
+	KEY idx_aggregate_id (aggregate_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+INSERT INTO product (id, name, price, stock, description)
+VALUES (1, 'iPhone 15', 6999.00, 100, '秒杀测试商品')
+ON DUPLICATE KEY UPDATE
+	name = VALUES(name),
+	price = VALUES(price),
+	description = VALUES(description);
