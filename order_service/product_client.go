@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log"
 	"time"
 
@@ -52,7 +51,7 @@ func initProductClient() {
 	}
 
 	productClient = pb.NewProductServiceClient(conn)
-	fmt.Println("已连接到商品服务 (RPC Client Ready)")
+	log.Println("product service grpc client ready")
 }
 
 func rollbackStock(productID, userID int64, count int32) error {

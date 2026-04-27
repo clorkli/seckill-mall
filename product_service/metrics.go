@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/http"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -18,9 +19,9 @@ func startMetricsServer() {
 
 		//===新增开发环境重置接口===
 		if config.Conf.Server.Mode == "debug" {
-			fmt.Println("警告：当前为开发环境，启用重置接口 /dev/reset")
+			log.Println("dev reset endpoint enabled path=/dev/reset")
 
-			//警告：仅限开发环境使用
+			// 仅限开发环境使用
 			http.HandleFunc("/dev/reset", func(w http.ResponseWriter, r *http.Request) {
 				//清空Redis
 				err := rdb.FlushDB(context.Background()).Err()
@@ -35,7 +36,7 @@ func startMetricsServer() {
 					w.Write([]byte("MySQL 订单表重置失败: " + err.Error()))
 					return
 				}
-				fmt.Println("MySQL 订单表已清空")
+				log.Println("dev reset truncated table=orders")
 
 				preheatStock()
 
@@ -43,7 +44,9 @@ func startMetricsServer() {
 			})
 		}
 		http.Handle("/metrics", promhttp.Handler())
-		fmt.Println("商品监控服务已启动：" + metricsAddr)
-		http.ListenAndServe(metricsAddr, nil)
+		log.Printf("product metrics server started addr=%s", metricsAddr)
+		if err := http.ListenAndServe(metricsAddr, nil); err != nil {
+			log.Printf("product metrics server failed: %v", err)
+		}
 	}()
 }

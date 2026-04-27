@@ -18,12 +18,12 @@ func main() {
 	startMetricsServer()
 	mqURL := config.Conf.MQ.URL
 	if mqURL == "" {
-		log.Fatal("mq.url 为空，请在 config/mq.yaml 设置或通过环境变量 SECKILL_MQ_URL 注入")
+		log.Fatal("mq url missing config=config/mq.yaml env=SECKILL_MQ_URL")
 	}
 
 	for {
 		if err := runConsumer(mqURL); err != nil {
-			log.Printf("主队列消费者停止: %v，%s 后重连", err, ReconnectDelay)
+			log.Printf("mq consumer stopped err=%v reconnect_after=%s", err, ReconnectDelay)
 			mqConsumerReconnectTotal.WithLabelValues("order").Inc()
 		}
 		time.Sleep(ReconnectDelay)

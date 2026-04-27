@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"fmt"
+	"log"
 
 	"seckill-mall/common/pb"
 )
@@ -13,7 +13,7 @@ type server struct {
 
 // GetProduct 实现
 func (s *server) GetProduct(ctx context.Context, req *pb.ProductRequest) (*pb.ProductResponse, error) {
-	fmt.Printf("[Trace]查询商品：%d\n", req.ProductId)
+	log.Printf("product get requested product_id=%d", req.ProductId)
 
 	var product Product
 	if err := db.First(&product, req.ProductId).Error; err != nil {

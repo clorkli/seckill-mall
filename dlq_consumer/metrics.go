@@ -67,9 +67,9 @@ func startMetricsServer() {
 	mux.Handle("/metrics", promhttp.Handler())
 
 	go func() {
-		log.Printf("DLQ Consumer metrics 已启动: %s/metrics", addr)
+		log.Printf("dlq metrics server started addr=%s", addr)
 		if err := http.ListenAndServe(addr, mux); err != nil {
-			log.Printf("DLQ Consumer metrics 启动失败: %v", err)
+			log.Printf("dlq metrics server failed: %v", err)
 		}
 	}()
 }

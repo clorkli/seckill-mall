@@ -19,14 +19,14 @@ func main() {
 
 	mqURL := config.Conf.MQ.URL
 	if mqURL == "" {
-		log.Fatal("mq.url 为空，请在 config/mq.yaml 设置或通过环境变量 SECKILL_MQ_URL 注入")
+		log.Fatal("mq url missing config=config/mq.yaml env=SECKILL_MQ_URL")
 	}
 
 	publisher := NewMQPublisher(mqURL)
 	if err := publisher.Connect(); err != nil {
-		log.Fatalf("初始化RabbitMQ发布器失败: %v", err)
+		log.Fatalf("outbox publisher init failed: %v", err)
 	}
 
-	log.Println("Outbox Worker 已启动，等待待投递事件...")
+	log.Println("outbox worker started")
 	runWorker(context.Background(), publisher)
 }

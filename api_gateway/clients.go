@@ -31,11 +31,11 @@ func initGRPCClients() grpcClients {
 		DialTimeout: 5 * time.Second,
 	})
 	if err != nil {
-		log.Fatalf("连接 Etcd 失败: %v", err)
+		log.Fatalf("etcd connect failed: %v", err)
 	}
 	etcdResolver, err := resolver.NewBuilder(cli)
 	if err != nil {
-		log.Fatalf("创建解析器失败: %v", err)
+		log.Fatalf("etcd resolver create failed: %v", err)
 	}
 
 	// 连接【商品服务】
@@ -47,7 +47,7 @@ func initGRPCClients() grpcClients {
 		grpc.WithDefaultServiceConfig(`{"loadBalancingPolicy":"round_robin"}`),
 	)
 	if err != nil {
-		log.Fatalf("无法连接商品服务: %v", err)
+		log.Fatalf("product grpc client dial failed: %v", err)
 	}
 	productClient := pb.NewProductServiceClient(connProduct)
 
@@ -60,7 +60,7 @@ func initGRPCClients() grpcClients {
 		grpc.WithDefaultServiceConfig(`{"loadBalancingPolicy":"round_robin"}`),
 	)
 	if err != nil {
-		log.Fatalf("无法连接订单服务: %v", err)
+		log.Fatalf("order grpc client dial failed: %v", err)
 	}
 	orderClient := pb.NewOrderServiceClient(connOrder)
 

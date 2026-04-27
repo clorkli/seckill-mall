@@ -20,16 +20,16 @@ import (
 func initDB() {
 	dsn := config.Conf.MySQL.DSN
 	if dsn == "" {
-		log.Fatalf("mysql.dsn 为空，请在 config/order.yaml 设置或通过环境变量 SECKILL_MYSQL_DSN 注入")
+		log.Fatalf("mysql dsn missing config=config/order.yaml env=SECKILL_MYSQL_DSN")
 	}
 
 	var err error
 	db, err = gorm.Open(mysql.Open(dsn), &gorm.Config{})
 	if err != nil {
-		log.Fatalf("连接MySQL失败: %v", err)
+		log.Fatalf("mysql connect failed component=order_service err=%v", err)
 	}
 
-	fmt.Println("已连接到 MySQL (Order Query Ready)")
+	log.Println("mysql connected component=order_service")
 }
 
 // === 注册自己到 Etcd ===
@@ -47,7 +47,7 @@ func registerEtcd(serviceAddr string) {
 		for range ch {
 		}
 	}()
-	fmt.Printf("✅ 订单服务已注册到 Etcd: %s\n", serviceAddr)
+	log.Printf("etcd registered service=order addr=%s", serviceAddr)
 }
 
 func startMetricsServer() {
@@ -55,10 +55,10 @@ func startMetricsServer() {
 	go func() {
 		metricsAddr := fmt.Sprintf(":%s", config.Conf.Server.MetricsPort)
 		http.Handle("/metrics", promhttp.Handler())
-		fmt.Printf("订单服务监控已启动 %s/metrics\n", metricsAddr)
+		log.Printf("order metrics server started addr=%s", metricsAddr)
 
 		if err := http.ListenAndServe(metricsAddr, nil); err != nil {
-			fmt.Printf("启动订单服务监控失败: %v", err) //这里没选择挂掉主服务
+			log.Printf("order metrics server failed: %v", err) // Do not stop the main service for metrics startup failure.
 		}
 	}()
 }

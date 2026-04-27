@@ -34,7 +34,7 @@ func main() {
 	grpcAddr := fmt.Sprintf(":%s", config.Conf.Server.Port)
 	lis, err := net.Listen("tcp", grpcAddr)
 	if err != nil {
-		log.Fatalf("监听失败：%v", err)
+		log.Fatalf("product listen failed addr=%s err=%v", grpcAddr, err)
 	}
 	s := grpc.NewServer(
 		grpc.StatsHandler(otelgrpc.NewServerHandler()),
@@ -48,9 +48,9 @@ func main() {
 
 	grpc_prometheus.Register(s)
 
-	fmt.Println("=== 商品微服务 (Redis版) 已启动 ===")
+	log.Printf("product service started addr=%s", grpcAddr)
 
 	if err := s.Serve(lis); err != nil {
-		log.Fatalf("服务启动失败：%v", err)
+		log.Fatalf("product service serve failed: %v", err)
 	}
 }

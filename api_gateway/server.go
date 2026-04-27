@@ -1,7 +1,7 @@
 package main
 
 import (
-	"fmt"
+	"log"
 	"net"
 
 	"github.com/gin-gonic/gin"
@@ -16,6 +16,8 @@ func startHTTPServer(r *gin.Engine) {
 	}
 
 	addr := net.JoinHostPort("", port)
-	fmt.Printf("=== API 网关已启动 (Port: %s) ===\n", addr)
-	r.Run(addr)
+	log.Printf("api gateway started addr=%s", addr)
+	if err := r.Run(addr); err != nil {
+		log.Fatalf("api gateway stopped: %v", err)
+	}
 }

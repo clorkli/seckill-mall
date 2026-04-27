@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log"
 	"time"
 
@@ -27,7 +26,7 @@ func handleMessage(d amqp.Delivery) {
 
 	var msg OrderMessage
 	if err := json.Unmarshal(d.Body, &msg); err != nil {
-		log.Printf("❌ 消息格式错误，直接丢弃: %v", err)
+		log.Printf("mq message invalid_json err=%v", err)
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "invalid message json")
 		mqConsumeTotal.WithLabelValues(OrderQueue, "invalid").Inc()
@@ -37,7 +36,7 @@ func handleMessage(d amqp.Delivery) {
 	}
 
 	if msg.Count <= 0 {
-		log.Printf("❌ 订单数量非法，进入死信: order_id=%s count=%d", msg.OrderID, msg.Count)
+		log.Printf("mq message invalid_count order_id=%s count=%d", msg.OrderID, msg.Count)
 		span.SetStatus(codes.Error, "invalid order count")
 		mqConsumeTotal.WithLabelValues(OrderQueue, "invalid").Inc()
 		mqConsumerNackTotal.WithLabelValues(OrderQueue, "false").Inc()
@@ -45,7 +44,7 @@ func handleMessage(d amqp.Delivery) {
 		return
 	}
 
-	fmt.Printf("📦 接收订单: %s | 数量：%d | 金额：%.2f | 处理中...", msg.OrderID, msg.Count, msg.Amount)
+	log.Printf("mq order received order_id=%s count=%d amount=%.2f", msg.OrderID, msg.Count, msg.Amount)
 
 	// 模拟业务处理耗时
 	time.Sleep(50 * time.Millisecond)
@@ -55,13 +54,13 @@ func handleMessage(d amqp.Delivery) {
 	if err != nil {
 		// 场景 A: 重复消费或已失败订单，幂等确认，避免重复扣减 product.stock。
 		if errors.Is(err, errOrderAlreadyFinished) {
-			fmt.Printf(" -> ⚠️ 订单已结束，确认消息\n")
+			log.Printf("mq order already_finished order_id=%s", msg.OrderID)
 			span.SetStatus(codes.Ok, "finished order acknowledged")
 			mqConsumeTotal.WithLabelValues(OrderQueue, "duplicate").Inc()
 			mqConsumerAckTotal.WithLabelValues(OrderQueue).Inc()
 			d.Ack(false)
 		} else if errors.Is(err, errMySQLStockNotEnough) {
-			log.Printf(" -> ❌ MySQL库存不足，发送 Nack(不重回队列)->进入死信")
+			log.Printf("mq order mysql_stock_not_enough order_id=%s product_id=%d count=%d", msg.OrderID, msg.ProductID, msg.Count)
 			span.RecordError(err)
 			span.SetStatus(codes.Error, "mysql stock not enough")
 			mqConsumeTotal.WithLabelValues(OrderQueue, "mysql_stock_not_enough").Inc()
@@ -69,7 +68,7 @@ func handleMessage(d amqp.Delivery) {
 			d.Nack(false, false)
 		} else {
 			// 场景 B: 真正的故障 (数据库挂了/网络抖动)
-			log.Printf(" -> ❌ 落库失败: %v，发送 Nack(不重回队列)->进入死信", err)
+			log.Printf("mq order persist_failed order_id=%s err=%v", msg.OrderID, err)
 			span.RecordError(err)
 			span.SetStatus(codes.Error, "persist order failed")
 
@@ -80,7 +79,7 @@ func handleMessage(d amqp.Delivery) {
 		}
 	} else {
 		// 场景 C: 成功
-		fmt.Printf(" -> ✅ 落库成功\n")
+		log.Printf("mq order persisted order_id=%s", msg.OrderID)
 		span.SetStatus(codes.Ok, "order persisted")
 		mqConsumeTotal.WithLabelValues(OrderQueue, "success").Inc()
 		mqConsumerAckTotal.WithLabelValues(OrderQueue).Inc()

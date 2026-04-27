@@ -24,7 +24,7 @@ func InitTracer(serviceName string, jaegerEndpoint string) func(context.Context)
 		otlptracehttp.WithTimeout(5*time.Second), // 加个超时防止卡死
 	)
 	if err != nil {
-		log.Fatalf("❌ 创建 Jaeger Exporter 失败: %v", err)
+		log.Fatalf("tracer exporter create failed: %v", err)
 	}
 
 	// 2. 简化资源定义 (只保留服务名，防止版本冲突)
@@ -35,7 +35,7 @@ func InitTracer(serviceName string, jaegerEndpoint string) func(context.Context)
 	)
 	if err != nil {
 		// 如果资源创建失败，就用默认的，不要 Panic
-		log.Printf("⚠️ 自定义 Resource 失败: %v, 使用默认 Resource", err)
+		log.Printf("tracer resource create failed, using default resource: %v", err)
 		res = resource.Default()
 	}
 
@@ -53,7 +53,7 @@ func InitTracer(serviceName string, jaegerEndpoint string) func(context.Context)
 		propagation.Baggage{},
 	))
 
-	log.Printf("✅ [%s] 链路追踪已就绪 -> %s", serviceName, jaegerEndpoint)
+	log.Printf("tracer ready service=%s endpoint=%s", serviceName, jaegerEndpoint)
 
 	return tp.Shutdown
 }

@@ -24,7 +24,7 @@ func processEvent(ctx context.Context, publisher *MQPublisher, event OutboxEvent
 
 	order, exists, err := getOrder(ctx, event.AggregateID)
 	if err != nil {
-		log.Printf("查询订单失败，延迟重试Outbox事件: event_id=%s err=%v", event.EventID, err)
+		log.Printf("outbox query order failed event_id=%s err=%v", event.EventID, err)
 		processResult = "query_order_failed"
 		scheduleRetry(ctx, event, err)
 		return
@@ -37,7 +37,7 @@ func processEvent(ctx context.Context, publisher *MQPublisher, event OutboxEvent
 	if order.Status == OrderStatusSuccess {
 		processResult = "order_success"
 		if err := markEventSent(ctx, event.EventID); err != nil {
-			log.Printf("订单已成功但标记Outbox已发送失败: event_id=%s err=%v", event.EventID, err)
+			log.Printf("outbox mark sent failed for successful order event_id=%s err=%v", event.EventID, err)
 			processResult = "mark_sent_failed"
 		}
 		return
@@ -50,7 +50,7 @@ func processEvent(ctx context.Context, publisher *MQPublisher, event OutboxEvent
 
 	msg, err := parseOrderMessage(event.Payload)
 	if err != nil {
-		log.Printf("Outbox事件payload非法，终止事件: event_id=%s err=%v", event.EventID, err)
+		log.Printf("outbox invalid payload event_id=%s err=%v", event.EventID, err)
 		processResult = "invalid_payload"
 		markEventAndOrderFailed(ctx, event, "Outbox事件payload非法: "+err.Error())
 		return
@@ -58,7 +58,7 @@ func processEvent(ctx context.Context, publisher *MQPublisher, event OutboxEvent
 
 	headers, err := parseHeaders(event.Headers)
 	if err != nil {
-		log.Printf("Outbox事件headers非法，将不带父trace继续发布: event_id=%s err=%v", event.EventID, err)
+		log.Printf("outbox invalid headers, publishing without parent trace event_id=%s err=%v", event.EventID, err)
 		headers = amqp.Table{}
 	}
 
@@ -72,7 +72,7 @@ func processEvent(ctx context.Context, publisher *MQPublisher, event OutboxEvent
 
 	publishStart := time.Now()
 	if err := publisher.Publish(publishCtx, []byte(event.Payload), headers); err != nil {
-		log.Printf("Outbox事件发布失败: event_id=%s retry_count=%d err=%v", event.EventID, event.RetryCount, err)
+		log.Printf("outbox publish failed event_id=%s retry_count=%d err=%v", event.EventID, event.RetryCount, err)
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "outbox publish failed")
 		processResult = "publish_failed"
@@ -85,7 +85,7 @@ func processEvent(ctx context.Context, publisher *MQPublisher, event OutboxEvent
 	outboxPublishDuration.WithLabelValues("success").Observe(time.Since(publishStart).Seconds())
 
 	if err := markEventSent(ctx, event.EventID); err != nil {
-		log.Printf("Outbox事件已发布但标记Sent失败，后续可能重复投递: event_id=%s err=%v", event.EventID, err)
+		log.Printf("outbox mark sent failed after publish event_id=%s err=%v", event.EventID, err)
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "mark outbox sent failed")
 		processResult = "mark_sent_failed"
@@ -94,7 +94,7 @@ func processEvent(ctx context.Context, publisher *MQPublisher, event OutboxEvent
 
 	span.SetStatus(codes.Ok, "outbox event published")
 	processResult = "published"
-	log.Printf("Outbox事件发布成功: event_id=%s order_id=%s", event.EventID, msg.OrderID)
+	log.Printf("outbox published event_id=%s order_id=%s", event.EventID, msg.OrderID)
 }
 
 func parseOrderMessage(payload string) (OrderMessage, error) {
@@ -103,16 +103,16 @@ func parseOrderMessage(payload string) (OrderMessage, error) {
 		return msg, err
 	}
 	if msg.OrderID == "" {
-		return msg, errors.New("order_id为空")
+		return msg, errors.New("order_id is empty")
 	}
 	if msg.UserID <= 0 {
-		return msg, fmt.Errorf("user_id非法: %d", msg.UserID)
+		return msg, fmt.Errorf("user_id is invalid: %d", msg.UserID)
 	}
 	if msg.ProductID <= 0 {
-		return msg, fmt.Errorf("product_id非法: %d", msg.ProductID)
+		return msg, fmt.Errorf("product_id is invalid: %d", msg.ProductID)
 	}
 	if msg.Count <= 0 {
-		return msg, fmt.Errorf("count非法: %d", msg.Count)
+		return msg, fmt.Errorf("count is invalid: %d", msg.Count)
 	}
 	return msg, nil
 }
@@ -139,7 +139,7 @@ func handlePublishFailure(ctx context.Context, event OutboxEvent, msg OrderMessa
 	if nextRetryCount < MaxRetryCount {
 		outboxRetryTotal.WithLabelValues("publish").Inc()
 		if err := scheduleRetryWithCount(ctx, event, nextRetryCount, publishErr); err != nil {
-			log.Printf("安排Outbox重试失败: event_id=%s err=%v", event.EventID, err)
+			log.Printf("outbox schedule retry failed event_id=%s err=%v", event.EventID, err)
 		}
 		return
 	}
@@ -148,24 +148,24 @@ func handlePublishFailure(ctx context.Context, event OutboxEvent, msg OrderMessa
 	if err != nil {
 		outboxCompensationTotal.WithLabelValues("failed").Inc()
 		outboxRetryTotal.WithLabelValues("compensation").Inc()
-		combinedErr := fmt.Errorf("MQ发布达到最大重试且Redis补偿失败: publish_err=%v compensation_err=%w", publishErr, err)
+		combinedErr := fmt.Errorf("mq publish reached max retry and redis compensation failed: publish_err=%v compensation_err=%w", publishErr, err)
 		if err := scheduleRetryWithCount(ctx, event, nextRetryCount, combinedErr); err != nil {
-			log.Printf("安排Outbox补偿重试失败: event_id=%s err=%v", event.EventID, err)
+			log.Printf("outbox schedule compensation retry failed event_id=%s err=%v", event.EventID, err)
 		}
 		return
 	}
 	outboxCompensationTotal.WithLabelValues("success").Inc()
 
 	if err := markEventAndOrderFailed(ctx, event, reason); err != nil {
-		log.Printf("标记Outbox和订单失败状态失败，稍后重试: event_id=%s err=%v", event.EventID, err)
+		log.Printf("outbox mark event and order failed status failed event_id=%s err=%v", event.EventID, err)
 		outboxRetryTotal.WithLabelValues("mark_failed").Inc()
 		if errRetry := scheduleRetryWithCount(ctx, event, nextRetryCount, err); errRetry != nil {
-			log.Printf("安排Outbox状态重试失败: event_id=%s err=%v", event.EventID, errRetry)
+			log.Printf("outbox schedule status retry failed event_id=%s err=%v", event.EventID, errRetry)
 		}
 		return
 	}
 
-	log.Printf("Outbox事件超过最大重试，已补偿Redis并标记订单失败: event_id=%s order_id=%s", event.EventID, msg.OrderID)
+	log.Printf("outbox max retry reached, compensated and failed order event_id=%s order_id=%s", event.EventID, msg.OrderID)
 }
 
 func runWorker(ctx context.Context, publisher *MQPublisher) {
@@ -175,7 +175,7 @@ func runWorker(ctx context.Context, publisher *MQPublisher) {
 	for {
 		events, err := claimPendingEvents(ctx, BatchSize)
 		if err != nil {
-			log.Printf("扫描Outbox事件失败: %v", err)
+			log.Printf("outbox scan failed err=%v", err)
 			outboxScanTotal.WithLabelValues("failed").Inc()
 		} else {
 			outboxScanTotal.WithLabelValues("success").Inc()

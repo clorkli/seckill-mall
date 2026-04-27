@@ -16,7 +16,7 @@ func initSentinel() {
 	// 初始化 Sentinel
 	err := sentinel.InitDefault()
 	if err != nil {
-		log.Fatalf("初始化 Sentinel 失败: %v", err)
+		log.Fatalf("sentinel init failed: %v", err)
 	}
 
 	// 配置限流规则
@@ -30,8 +30,8 @@ func initSentinel() {
 		},
 	})
 	if err != nil {
-		log.Fatalf("加载限流规则失败: %v", err)
+		log.Fatalf("sentinel load rules failed: %v", err)
 	}
 
-	log.Printf("Sentinel限流规则已加载：%s 每秒最大请求数 %.0f", resourceName, threshold)
+	log.Printf("sentinel rule loaded resource=%s threshold_per_second=%.0f", resourceName, threshold)
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"math/rand"
 	"time"
 
@@ -47,7 +48,7 @@ func orderStatusMessage(status int32) string {
 
 // CreateOrder 下单逻辑 (异步版)
 func (s *server) CreateOrder(ctx context.Context, req *pb.CreateOrderRequest) (*pb.CreateOrderResponse, error) {
-	fmt.Printf("收到下单请求，用户: %d, 商品: %d\n", req.UserId, req.ProductId)
+	log.Printf("order create requested user_id=%d product_id=%d count=%d", req.UserId, req.ProductId, req.Count)
 
 	if req.Count <= 0 {
 		return &pb.CreateOrderResponse{
@@ -67,7 +68,7 @@ func (s *server) CreateOrder(ctx context.Context, req *pb.CreateOrderRequest) (*
 	}
 
 	if !deductResp.Success {
-		fmt.Printf("库存不足，秒杀失败\n")
+		log.Printf("order create rejected user_id=%d product_id=%d reason=%q", req.UserId, req.ProductId, deductResp.Message)
 		return &pb.CreateOrderResponse{
 			Success: false,
 			Message: deductResp.Message,
@@ -108,7 +109,7 @@ func (s *server) CreateOrder(ctx context.Context, req *pb.CreateOrderRequest) (*
 		return nil, fmt.Errorf("创建排队订单和Outbox事件失败: %w", err)
 	}
 
-	fmt.Printf("下单请求已写入Outbox，订单ID: %s\n", orderID)
+	log.Printf("order enqueued order_id=%s user_id=%d product_id=%d count=%d", orderID, req.UserId, req.ProductId, req.Count)
 
 	return &pb.CreateOrderResponse{
 		OrderId: orderID,

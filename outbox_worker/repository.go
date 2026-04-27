@@ -49,7 +49,7 @@ func updateOutboxPendingGauge(ctx context.Context) {
 		Model(&OutboxEvent{}).
 		Where("status = ?", OutboxStatusPending).
 		Count(&count).Error; err != nil {
-		log.Printf("统计Outbox待投递事件失败: %v", err)
+		log.Printf("outbox pending count failed err=%v", err)
 		return
 	}
 
@@ -59,7 +59,7 @@ func updateOutboxPendingGauge(ctx context.Context) {
 func scheduleRetry(ctx context.Context, event OutboxEvent, err error) {
 	outboxRetryTotal.WithLabelValues("process").Inc()
 	if errRetry := scheduleRetryWithCount(ctx, event, event.RetryCount+1, err); errRetry != nil {
-		log.Printf("安排Outbox重试失败: event_id=%s err=%v", event.EventID, errRetry)
+		log.Printf("outbox schedule retry failed event_id=%s err=%v", event.EventID, errRetry)
 	}
 }
 
@@ -103,7 +103,7 @@ func markEventFailed(ctx context.Context, event OutboxEvent, reason string) {
 			"status":     OutboxStatusFailed,
 			"last_error": truncateText(reason, 255),
 		}).Error; err != nil {
-		log.Printf("标记Outbox事件失败状态失败: event_id=%s err=%v", event.EventID, err)
+		log.Printf("outbox mark failed status failed event_id=%s err=%v", event.EventID, err)
 	}
 }
 

@@ -16,16 +16,16 @@ import (
 
 func validateMessage(msg OrderMessage) error {
 	if msg.OrderID == "" {
-		return fmt.Errorf("order_id 为空")
+		return fmt.Errorf("order_id is empty")
 	}
 	if msg.UserID <= 0 {
-		return fmt.Errorf("user_id 非法: %d", msg.UserID)
+		return fmt.Errorf("user_id is invalid: %d", msg.UserID)
 	}
 	if msg.ProductID <= 0 {
-		return fmt.Errorf("product_id 非法: %d", msg.ProductID)
+		return fmt.Errorf("product_id is invalid: %d", msg.ProductID)
 	}
 	if msg.Count <= 0 {
-		return fmt.Errorf("count 非法: %d", msg.Count)
+		return fmt.Errorf("count is invalid: %d", msg.Count)
 	}
 	return nil
 }
@@ -42,7 +42,7 @@ func handleMessage(d amqp.Delivery) {
 
 	var msg OrderMessage
 	if err := json.Unmarshal(d.Body, &msg); err != nil {
-		log.Printf("❌ 死信消息格式错误，无法补偿，确认消息: %v", err)
+		log.Printf("dlq message invalid_json err=%v", err)
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "invalid dlq message json")
 		dlqConsumeTotal.WithLabelValues("invalid").Inc()
@@ -52,7 +52,7 @@ func handleMessage(d amqp.Delivery) {
 	}
 
 	if err := validateMessage(msg); err != nil {
-		log.Printf("❌ 死信消息字段非法，无法自动补偿，确认消息: %v", err)
+		log.Printf("dlq message invalid_fields err=%v", err)
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "invalid dlq message fields")
 		dlqConsumeTotal.WithLabelValues("invalid").Inc()
@@ -66,7 +66,7 @@ func handleMessage(d amqp.Delivery) {
 
 	order, exists, err := getOrder(ctx, msg.OrderID)
 	if err != nil {
-		log.Printf("⚠️ 查询订单失败，稍后重试: order_id=%s err=%v", msg.OrderID, err)
+		log.Printf("dlq order query_failed order_id=%s err=%v", msg.OrderID, err)
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "query order failed")
 		dlqConsumeTotal.WithLabelValues("retry").Inc()
@@ -77,7 +77,7 @@ func handleMessage(d amqp.Delivery) {
 	}
 
 	if exists && order.Status == OrderStatusSuccess {
-		log.Printf("✅ 订单已成功，无需回滚Redis，确认死信: order_id=%s", msg.OrderID)
+		log.Printf("dlq order already_success order_id=%s", msg.OrderID)
 		span.SetStatus(codes.Ok, "order already exists")
 		dlqConsumeTotal.WithLabelValues("order_exists").Inc()
 		mqConsumerAckTotal.WithLabelValues(DeadQueue).Inc()
@@ -85,7 +85,7 @@ func handleMessage(d amqp.Delivery) {
 		return
 	}
 	if exists && order.Status == OrderStatusFailed {
-		log.Printf("✅ 订单已标记失败，无需重复补偿: order_id=%s", msg.OrderID)
+		log.Printf("dlq order already_failed order_id=%s", msg.OrderID)
 		span.SetStatus(codes.Ok, "order already failed")
 		dlqConsumeTotal.WithLabelValues("already_failed").Inc()
 		mqConsumerAckTotal.WithLabelValues(DeadQueue).Inc()
@@ -93,7 +93,7 @@ func handleMessage(d amqp.Delivery) {
 		return
 	}
 	if exists && order.Status != OrderStatusPending {
-		log.Printf("❌ 未知订单状态，需人工核查，确认死信: order_id=%s status=%d", msg.OrderID, order.Status)
+		log.Printf("dlq order unknown_status order_id=%s status=%d", msg.OrderID, order.Status)
 		span.SetStatus(codes.Error, "unknown order status")
 		dlqConsumeTotal.WithLabelValues("manual_check").Inc()
 		mqConsumerAckTotal.WithLabelValues(DeadQueue).Inc()
@@ -103,7 +103,7 @@ func handleMessage(d amqp.Delivery) {
 
 	code, err := rollbackRedis(ctx, msg)
 	if err != nil {
-		log.Printf("⚠️ Redis回滚失败，稍后重试: order_id=%s err=%v", msg.OrderID, err)
+		log.Printf("dlq redis rollback_failed order_id=%s err=%v", msg.OrderID, err)
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "redis rollback failed")
 		dlqConsumeTotal.WithLabelValues("retry").Inc()

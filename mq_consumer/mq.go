@@ -13,19 +13,19 @@ func setupQueue(ch *amqp.Channel) (amqp.Queue, error) {
 	//声明死信交换机
 	err := ch.ExchangeDeclare(DeadExchange, "direct", true, false, false, false, nil)
 	if err != nil {
-		return amqp.Queue{}, fmt.Errorf("无法声明死信交换机: %w", err)
+		return amqp.Queue{}, fmt.Errorf("declare dead exchange failed: %w", err)
 	}
 
 	//声明死信队列
 	_, err = ch.QueueDeclare(DeadQueue, true, false, false, false, nil)
 	if err != nil {
-		return amqp.Queue{}, fmt.Errorf("无法声明死信队列: %w", err)
+		return amqp.Queue{}, fmt.Errorf("declare dead queue failed: %w", err)
 	}
 
 	//绑定：死信交换机 -> 死信队列
 	err = ch.QueueBind(DeadQueue, DeadRoutingKey, DeadExchange, false, nil)
 	if err != nil {
-		return amqp.Queue{}, fmt.Errorf("无法绑定死信队列: %w", err)
+		return amqp.Queue{}, fmt.Errorf("bind dead queue failed: %w", err)
 	}
 
 	//声明主队列（业务队列），并配置它“连接”到死信交换机
@@ -43,29 +43,29 @@ func setupQueue(ch *amqp.Channel) (amqp.Queue, error) {
 		args, //把死信参数传进去
 	)
 	if err != nil {
-		return amqp.Queue{}, fmt.Errorf("无法声明主队列(可能参数冲突，请先去后台删除旧队列): %w", err)
+		return amqp.Queue{}, fmt.Errorf("declare order queue failed: %w", err)
 	}
 
-	log.Printf("✅ RabbitMQ 队列结构初始化完成：主队列[%s] -> 死信[%s]", OrderQueue, DeadQueue)
+	log.Printf("rabbitmq queues ready order_queue=%s dead_queue=%s", OrderQueue, DeadQueue)
 	return q, nil
 }
 
 func runConsumer(mqURL string) error {
 	conn, err := amqp.Dial(mqURL)
 	if err != nil {
-		return fmt.Errorf("连接RabbitMQ失败: %w", err)
+		return fmt.Errorf("rabbitmq connect failed: %w", err)
 	}
 	defer conn.Close()
 
 	ch, err := conn.Channel()
 	if err != nil {
-		return fmt.Errorf("创建MQ通道失败: %w", err)
+		return fmt.Errorf("rabbitmq channel create failed: %w", err)
 	}
 	defer ch.Close()
 
 	// 2. 这里的 Qos 很重要，保证消费者不被撑死
 	if err := ch.Qos(1, 0, false); err != nil {
-		return fmt.Errorf("设置Qos失败: %w", err)
+		return fmt.Errorf("rabbitmq qos set failed: %w", err)
 	}
 
 	// 3. 调用 setupQueue 获取配置好 DLQ 的队列对象
@@ -85,10 +85,10 @@ func runConsumer(mqURL string) error {
 		nil,
 	)
 	if err != nil {
-		return fmt.Errorf("启动消费失败: %w", err)
+		return fmt.Errorf("consume order queue failed: %w", err)
 	}
 
-	fmt.Println("📧 消费者服务已启动 (DLQ版)，等待订单中...")
+	log.Printf("mq consumer started queue=%s", q.Name)
 
 	connClosed := conn.NotifyClose(make(chan *amqp.Error, 1))
 	chClosed := ch.NotifyClose(make(chan *amqp.Error, 1))
@@ -97,19 +97,19 @@ func runConsumer(mqURL string) error {
 		select {
 		case d, ok := <-msgs:
 			if !ok {
-				return errors.New("RabbitMQ delivery channel 已关闭")
+				return errors.New("rabbitmq delivery channel closed")
 			}
 			handleMessage(d)
 		case err, ok := <-connClosed:
 			if !ok || err == nil {
-				return errors.New("RabbitMQ connection 已关闭")
+				return errors.New("rabbitmq connection closed")
 			}
-			return fmt.Errorf("RabbitMQ connection 异常关闭: %w", err)
+			return fmt.Errorf("rabbitmq connection closed with error: %w", err)
 		case err, ok := <-chClosed:
 			if !ok || err == nil {
-				return errors.New("RabbitMQ channel 已关闭")
+				return errors.New("rabbitmq channel closed")
 			}
-			return fmt.Errorf("RabbitMQ channel 异常关闭: %w", err)
+			return fmt.Errorf("rabbitmq channel closed with error: %w", err)
 		}
 	}
 }

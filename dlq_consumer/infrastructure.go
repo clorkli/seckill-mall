@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log"
 
 	"github.com/redis/go-redis/v9"
@@ -15,15 +14,15 @@ import (
 func initDB() {
 	dsn := config.Conf.MySQL.DSN
 	if dsn == "" {
-		log.Fatal("mysql.dsn 为空，请在 config/mq.yaml 设置或通过环境变量 SECKILL_MYSQL_DSN 注入")
+		log.Fatal("mysql dsn missing config=config/mq.yaml env=SECKILL_MYSQL_DSN")
 	}
 
 	var err error
 	db, err = gorm.Open(mysql.Open(dsn), &gorm.Config{})
 	if err != nil {
-		log.Fatalf("连接MySQL失败: %v", err)
+		log.Fatalf("mysql connect failed component=dlq_consumer err=%v", err)
 	}
-	fmt.Println("✅ MySQL 连接成功")
+	log.Println("mysql connected component=dlq_consumer")
 }
 
 func initRedis() {
@@ -34,7 +33,7 @@ func initRedis() {
 	})
 
 	if err := rdb.Ping(context.Background()).Err(); err != nil {
-		log.Fatalf("连接 Redis 失败: %v", err)
+		log.Fatalf("redis connect failed component=dlq_consumer err=%v", err)
 	}
-	fmt.Println("✅ Redis 连接成功")
+	log.Println("redis connected component=dlq_consumer")
 }

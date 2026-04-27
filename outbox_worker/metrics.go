@@ -87,9 +87,9 @@ func startMetricsServer() {
 	mux.Handle("/metrics", promhttp.Handler())
 
 	go func() {
-		log.Printf("Outbox Worker metrics 已启动: %s/metrics", addr)
+		log.Printf("outbox metrics server started addr=%s", addr)
 		if err := http.ListenAndServe(addr, mux); err != nil {
-			log.Printf("Outbox Worker metrics 启动失败: %v", err)
+			log.Printf("outbox metrics server failed: %v", err)
 		}
 	}()
 }

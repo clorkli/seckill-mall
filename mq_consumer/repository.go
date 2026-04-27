@@ -27,7 +27,7 @@ func persistOrder(ctx context.Context, msg OrderMessage) error {
 			return errOrderAlreadyFinished
 		}
 		if order.Status != OrderStatusPending {
-			return fmt.Errorf("未知订单状态: order_id=%s status=%d", msg.OrderID, order.Status)
+			return fmt.Errorf("unknown order status: order_id=%s status=%d", msg.OrderID, order.Status)
 		}
 
 		if err := decrementMySQLStock(tx, msg); err != nil {

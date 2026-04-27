@@ -27,13 +27,13 @@ func (p *MQPublisher) Connect() error {
 
 	conn, err := amqp.Dial(p.url)
 	if err != nil {
-		return fmt.Errorf("连接RabbitMQ失败: %w", err)
+		return fmt.Errorf("rabbitmq connect failed: %w", err)
 	}
 
 	ch, err := conn.Channel()
 	if err != nil {
 		conn.Close()
-		return fmt.Errorf("创建RabbitMQ通道失败: %w", err)
+		return fmt.Errorf("rabbitmq channel create failed: %w", err)
 	}
 
 	if err := setupQueues(ch); err != nil {
@@ -45,7 +45,7 @@ func (p *MQPublisher) Connect() error {
 	if err := ch.Confirm(false); err != nil {
 		ch.Close()
 		conn.Close()
-		return fmt.Errorf("开启Publisher Confirm失败: %w", err)
+		return fmt.Errorf("enable publisher confirm failed: %w", err)
 	}
 
 	p.conn = conn
@@ -60,7 +60,7 @@ func (p *MQPublisher) Publish(ctx context.Context, payload []byte, headers amqp.
 	if err := p.publish(ctx, payload, headers); err == nil {
 		return nil
 	} else {
-		log.Printf("Outbox发布MQ失败，尝试重连后重试一次: %v", err)
+		log.Printf("outbox publish failed, reconnecting err=%v", err)
 	}
 
 	outboxReconnectTotal.Inc()
@@ -95,18 +95,18 @@ func (p *MQPublisher) publish(ctx context.Context, payload []byte, headers amqp.
 			Body:         payload,
 		},
 	); err != nil {
-		return fmt.Errorf("发布消息失败: %w", err)
+		return fmt.Errorf("publish message failed: %w", err)
 	}
 
 	select {
 	case ret, ok := <-p.returns:
 		if !ok {
-			return errors.New("RabbitMQ return channel 已关闭")
+			return errors.New("rabbitmq return channel closed")
 		}
 		return formatReturnedMessage(ret)
 	case confirm, ok := <-p.confirms:
 		if !ok {
-			return errors.New("RabbitMQ confirm channel 已关闭")
+			return errors.New("rabbitmq confirm channel closed")
 		}
 		if !confirm.Ack {
 			return fmt.Errorf("RabbitMQ Nack delivery_tag=%d", confirm.DeliveryTag)
@@ -116,7 +116,7 @@ func (p *MQPublisher) publish(ctx context.Context, payload []byte, headers amqp.
 		}
 		return nil
 	case <-ctx.Done():
-		return fmt.Errorf("等待RabbitMQ确认超时或取消: %w", ctx.Err())
+		return fmt.Errorf("wait rabbitmq confirm failed: %w", ctx.Err())
 	}
 }
 
@@ -130,7 +130,7 @@ func readReturnedMessage(returns <-chan amqp.Return) (amqp.Return, bool) {
 }
 
 func formatReturnedMessage(ret amqp.Return) error {
-	return fmt.Errorf("消息无法路由: reply_code=%d reply_text=%s exchange=%s routing_key=%s", ret.ReplyCode, ret.ReplyText, ret.Exchange, ret.RoutingKey)
+	return fmt.Errorf("message returned unroutable: reply_code=%d reply_text=%s exchange=%s routing_key=%s", ret.ReplyCode, ret.ReplyText, ret.Exchange, ret.RoutingKey)
 }
 
 func (p *MQPublisher) close() {
@@ -148,15 +148,15 @@ func (p *MQPublisher) close() {
 
 func setupQueues(ch *amqp.Channel) error {
 	if err := ch.ExchangeDeclare(DeadExchange, "direct", true, false, false, false, nil); err != nil {
-		return fmt.Errorf("声明死信交换机失败: %w", err)
+		return fmt.Errorf("declare dead exchange failed: %w", err)
 	}
 
 	if _, err := ch.QueueDeclare(DeadQueue, true, false, false, false, nil); err != nil {
-		return fmt.Errorf("声明死信队列失败: %w", err)
+		return fmt.Errorf("declare dead queue failed: %w", err)
 	}
 
 	if err := ch.QueueBind(DeadQueue, DeadRoutingKey, DeadExchange, false, nil); err != nil {
-		return fmt.Errorf("绑定死信队列失败: %w", err)
+		return fmt.Errorf("bind dead queue failed: %w", err)
 	}
 
 	args := amqp.Table{
@@ -164,7 +164,7 @@ func setupQueues(ch *amqp.Channel) error {
 		"x-dead-letter-routing-key": DeadRoutingKey,
 	}
 	if _, err := ch.QueueDeclare(OrderQueue, true, false, false, false, args); err != nil {
-		return fmt.Errorf("声明主队列失败: %w", err)
+		return fmt.Errorf("declare order queue failed: %w", err)
 	}
 
 	return nil

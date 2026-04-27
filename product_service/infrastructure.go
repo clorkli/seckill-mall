@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"strconv"
 
@@ -26,9 +25,9 @@ func initRedis() {
 
 	// 测试连接
 	if err := rdb.Ping(context.Background()).Err(); err != nil {
-		log.Fatalf("连接 Redis 失败: %v", err)
+		log.Fatalf("redis connect failed component=product_service err=%v", err)
 	}
-	fmt.Println("Redis 连接成功！")
+	log.Println("redis connected component=product_service")
 }
 
 // 新增：预热库存到 Redis
@@ -44,9 +43,9 @@ func preheatStock() {
 		// 这里的 value 就是库存数
 		err := rdb.SetNX(context.Background(), key, p.Stock, 0).Err()
 		if err != nil {
-			fmt.Printf("预热库存失败 %d: %v\n", p.ID, err)
+			log.Printf("stock preheat failed product_id=%d err=%v", p.ID, err)
 		} else {
-			fmt.Printf("🔥 库存已预热: %s => %d\n", key, p.Stock)
+			log.Printf("stock preheated key=%s stock=%d", key, p.Stock)
 		}
 	}
 }
@@ -66,19 +65,19 @@ func RegisterEtcd(port string) {
 		for range ch {
 		}
 	}()
-	fmt.Printf("服务已注册到 Etcd: %s\n", myAddr)
+	log.Printf("etcd registered service=product addr=%s", myAddr)
 }
 
 func initDB() {
 	dsn := config.Conf.MySQL.DSN
 	if dsn == "" {
-		log.Fatal("mysql.dsn 为空，请在 config/product.yaml 设置或通过环境变量 SECKILL_MYSQL_DSN 注入")
+		log.Fatal("mysql dsn missing config=config/product.yaml env=SECKILL_MYSQL_DSN")
 	}
 
 	var err error
 	db, err = gorm.Open(mysql.Open(dsn), &gorm.Config{})
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("mysql connect failed component=product_service err=%v", err)
 	}
-	fmt.Println("MySQL 连接成功！")
+	log.Println("mysql connected component=product_service")
 }

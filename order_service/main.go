@@ -25,7 +25,7 @@ func main() {
 	port := config.Conf.Server.Port
 	if port == "" {
 		port = "50052"
-		log.Println("配置文件未指定端口，使用默认端口 50052")
+		log.Println("server port not configured, using default port=50052")
 	}
 	//最好使用宿主机真实IP地址，避免容器重启后地址变化导致注册失败
 	myAddr := "127.0.0.1:" + port
@@ -38,7 +38,7 @@ func main() {
 	grpcAddr := fmt.Sprintf(":%s", config.Conf.Server.Port)
 	lis, err := net.Listen("tcp", grpcAddr)
 	if err != nil {
-		log.Fatalf("监听端口失败 %s: %v", port, err)
+		log.Fatalf("order listen failed port=%s err=%v", port, err)
 	}
 
 	//创建gRPC服务器时添加拦截器
@@ -50,8 +50,8 @@ func main() {
 
 	grpc_prometheus.Register(s)
 
-	fmt.Printf("=== 订单微服务已启动 (Port: %s) ===", grpcAddr)
+	log.Printf("order service started addr=%s", grpcAddr)
 	if err := s.Serve(lis); err != nil {
-		log.Fatalf("服务启动失败: %v", err)
+		log.Fatalf("order service serve failed: %v", err)
 	}
 }

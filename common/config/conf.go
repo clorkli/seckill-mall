@@ -64,17 +64,17 @@ func InitConfig(filename string) {
 	viper.SetConfigType("yaml")   // 文件格式
 
 	if err := viper.ReadInConfig(); err != nil {
-		log.Fatalf("读取配置文件失败: %v", err)
+		log.Fatalf("config read failed: %v", err)
 	}
 
 	// 将读取的配置映射到结构体中
 	if err := viper.Unmarshal(&Conf); err != nil {
-		log.Fatalf("解析配置文件失败: %v", err)
+		log.Fatalf("config unmarshal failed: %v", err)
 	}
 
 	applyEnvOverrides()
 
-	log.Println("配置加载成功！")
+	log.Println("config loaded")
 }
 
 func applyEnvOverrides() {

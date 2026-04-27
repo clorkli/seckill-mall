@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"strconv"
 
@@ -66,7 +65,7 @@ return 1
 
 // 升级 DeductStock 接口，区分库存为零与商品不存在两种情况
 func (s *server) DeductStock(ctx context.Context, req *pb.DeductStockRequest) (*pb.DeductStockResponse, error) {
-	fmt.Printf("[Trace]扣减库存：用户%d, 商品%d, 数量%d\n", req.UserId, req.ProductId, req.Count)
+	log.Printf("stock deduct requested user_id=%d product_id=%d count=%d", req.UserId, req.ProductId, req.Count)
 
 	if req.Count <= 0 {
 		return &pb.DeductStockResponse{
@@ -89,29 +88,29 @@ func (s *server) DeductStock(ctx context.Context, req *pb.DeductStockRequest) (*
 	val, err := rdb.Eval(ctx, LUA_SCRIPT, []string{stockKey, userSetKey}, req.Count, req.UserId, PurchaseLimit).Int()
 
 	if err != nil {
-		log.Printf("Redis执行异常: %v", err)
+		log.Printf("stock deduct redis eval failed user_id=%d product_id=%d count=%d err=%v", req.UserId, req.ProductId, req.Count, err)
 		return nil, err
 	}
 
 	// 根据 Lua 返回的状态码进行精准处理
 	switch val {
 	case 0: // 商品不存在
-		log.Printf("拒绝扣减：商品 %d 未预热或不存在", req.ProductId)
+		log.Printf("stock deduct rejected product_id=%d reason=missing_stock_key", req.ProductId)
 		return &pb.DeductStockResponse{
 			Success: false,
 			Message: "商品不存在或未上架", //给出明确的错误提示
 		}, nil
 	case 2: // 库存不足
-		log.Printf("拒绝扣减：商品 %d 库存不足", req.ProductId)
+		log.Printf("stock deduct rejected product_id=%d reason=stock_not_enough", req.ProductId)
 		return &pb.DeductStockResponse{
 			Success: false,
 			Message: "库存不足",
 		}, nil
 	case 1: // 成功
-		fmt.Printf("扣减成功：用户%d买到了商品 %d \n", req.UserId, req.ProductId)
+		log.Printf("stock deducted user_id=%d product_id=%d count=%d", req.UserId, req.ProductId, req.Count)
 		return &pb.DeductStockResponse{Success: true, Message: "扣减成功"}, nil
 	case 3: // 重复购买
-		log.Printf("超过限购：用户 %d 试图购买商品 %d 一共%d件，限购%d 件", req.UserId, req.ProductId, req.Count, PurchaseLimit)
+		log.Printf("stock deduct rejected user_id=%d product_id=%d count=%d limit=%d reason=purchase_limit_exceeded", req.UserId, req.ProductId, req.Count, PurchaseLimit)
 		return &pb.DeductStockResponse{
 			Success: false,
 			Message: "每人限购一件，您已购买过该商品，不能重复购买",
@@ -123,7 +122,7 @@ func (s *server) DeductStock(ctx context.Context, req *pb.DeductStockRequest) (*
 
 // 实现 RollbackStock 接口
 func (s *server) RollbackStock(ctx context.Context, req *pb.DeductStockRequest) (*pb.DeductStockResponse, error) {
-	fmt.Printf("[Rollback]收到回滚请求：用户%d, 商品%d, 数量%d\n", req.UserId, req.ProductId, req.Count)
+	log.Printf("stock rollback requested user_id=%d product_id=%d count=%d", req.UserId, req.ProductId, req.Count)
 
 	if req.Count <= 0 {
 		return &pb.DeductStockResponse{
@@ -137,7 +136,7 @@ func (s *server) RollbackStock(ctx context.Context, req *pb.DeductStockRequest) 
 
 	val, err := rdb.Eval(ctx, ROLLBACK_LUA_SCRIPT, []string{stockKey, userSetKey}, req.Count, req.UserId).Int()
 	if err != nil {
-		fmt.Printf("X! 回滚失败，CRITICAL ERROR：%v\n", err)
+		log.Printf("stock rollback redis eval failed user_id=%d product_id=%d count=%d err=%v", req.UserId, req.ProductId, req.Count, err)
 		return &pb.DeductStockResponse{Success: false, Message: "回滚失败: " + err.Error()}, nil
 	}
 
@@ -145,7 +144,7 @@ func (s *server) RollbackStock(ctx context.Context, req *pb.DeductStockRequest) 
 	case 0:
 		return &pb.DeductStockResponse{Success: false, Message: "商品库存不存在，无法回滚"}, nil
 	case 1:
-		fmt.Printf("回滚成功，库存和用户购买记录已恢复\n")
+		log.Printf("stock rollback succeeded user_id=%d product_id=%d count=%d", req.UserId, req.ProductId, req.Count)
 		return &pb.DeductStockResponse{Success: true, Message: "回滚成功"}, nil
 	case 2:
 		return &pb.DeductStockResponse{Success: false, Message: "回滚数量必须大于0"}, nil
